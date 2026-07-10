@@ -235,9 +235,6 @@ return data.choices[0].message.content;
   중요 설정
 만 작성하세요.
 
-
-...
-
 ${conversation}
 `;
 
