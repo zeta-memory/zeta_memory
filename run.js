@@ -42,16 +42,35 @@
 - 장소가 명시되지 않았다면 이전 장소를 유지하세요.
 - 앞으로 일어날 일을 예측하지 마세요.
 - 확정된 사실만 기록하세요.
-- 관계 변화는 유지하세요.
-- 감정 변화는 유지하세요.
 - 반복되는 사건은 제거하세요.
 - 1200자 이내.
+
+[인물 혼동 방지 - 매우 중요]
+- 외형, 신체적 특징(흉터, 상처, 나이, 옷차림 등), 소지품은 반드시 그 특징을 가진
+  인물의 이름과 함께 정확히 묶어서 기록하세요.
+- 어떤 인물의 특징인지 대화에서 명확하지 않다면, 절대로 다른 인물에게 임의로
+  배정하지 말고 생략하세요.
+- 이전 Memory에 이미 특정 인물에게 귀속된 특징이 있다면, 새 대화에서 그 인물이
+  다시 언급되지 않는 한 그대로 유지하세요. 다른 인물에게 옮기지 마세요.
+
+[분위기와 관계 상태를 혼동하지 마세요 - 매우 중요]
+- "무거운 분위기", "진지한 대화", "침묵", "긴장감"은 그 자체로 관계 상태가
+  아닙니다. 톤/분위기와 관계 상태(우호적/적대적/썸/연인 등)는 서로 다른
+  항목입니다.
+- 관계 상태는 오직 대사나 행동에서 명확히 드러난 경우에만 갱신하세요.
+  예: 고백, 다툼, 화해, 명시적 거절, 스킨십 등.
+- 예를 들어 고백하는 장면이 어색하거나 무겁게 흘러갔다고 해서 "적대적 관계"로
+  바꾸지 마세요. 고백이 받아들여졌는지/거절당했는지/아직 답을 안 했는지
+  대화에 드러난 그대로만 기록하세요.
 
 아래 형식을 반드시 그대로 지켜서 작성하세요 (라벨과 콜론(:) 포함):
 
 현재 장소: ...
 현재 관계: ...
 현재 상황: ...
+등장인물:
+- (이름): 외형/신체적 특징, 현재 상태 (해당 인물에 대해 확인된 것만)
+- (이름): ...
 중요 설정: ...`;
 
     const DEFAULT_SETTINGS = {
@@ -538,6 +557,7 @@
                     },
                     body: JSON.stringify({
                         model: profile.model,
+                        temperature: 0,
                         messages: [{ role: "user", content: prompt }]
                     })
                 });
@@ -589,12 +609,12 @@
         return Number(localStorage.getItem(MEMORY_INDEX_KEY) || 0);
     }
 
-    const FIELD_LABELS = ["현재 장소", "현재 관계", "현재 상황", "중요 설정"];
+    const FIELD_LABELS = ["현재 장소", "현재 관계", "현재 상황", "등장인물", "중요 설정"];
 
     function parseMemoryFields(text) {
 
-        const fields = { location: "", relationship: "", situation: "", setting: "" };
-        const keys = ["location", "relationship", "situation", "setting"];
+        const fields = { location: "", relationship: "", situation: "", characters: "", setting: "" };
+        const keys = ["location", "relationship", "situation", "characters", "setting"];
 
         if (!text) return fields;
 
@@ -611,7 +631,7 @@
     }
 
     function buildMemoryText(fields) {
-        return `현재 장소: ${fields.location}\n현재 관계: ${fields.relationship}\n현재 상황: ${fields.situation}\n중요 설정: ${fields.setting}`;
+        return `현재 장소: ${fields.location}\n현재 관계: ${fields.relationship}\n현재 상황: ${fields.situation}\n등장인물: ${fields.characters}\n중요 설정: ${fields.setting}`;
     }
 
     function applyLocks(newText, previousText, locks) {
