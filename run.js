@@ -220,22 +220,37 @@ return data.choices[0].message.content;
 
 규칙
 
-- 현재 상황만 남긴다.
-- 반복되는 대화는 제거한다.
-- 장소를 유지한다.
-- 관계를 유지한다.
-- 앞으로 RP에 필요한 정보만 남긴다.
-- 1500자 이내.
+- 추측하지 마세요.
+- 앞으로 일어날 일을 예측하지 마세요.
+- 확정된 사실만 기록하세요.
+- 장소는 현재 장소만 유지하세요.
+- 관계 변화는 유지하세요.
+- 감정 변화는 유지하세요.
+- 반복되는 사건은 제거하세요.
+- 1200자 이내.
+- 항목은
+  현재 장소
+  현재 관계
+  현재 상황
+  중요 설정
+만 작성하세요.
 
-대화
+
+...
 
 ${conversation}
 `;
 
-    return await callOpenAI(prompt);
+const memory = await callOpenAI(prompt);
+
+localStorage.setItem(
+    `${STORAGE_KEY}-memory`,
+    memory
+);
+
+return memory;
 
 }
-   
    
    //------------------------------------------
     // Auto Save
