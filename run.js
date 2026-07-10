@@ -252,13 +252,11 @@ localStorage.setItem(
     memory
 );
 
+updatingMemory = false;
+
 return memory;
 
-} finally {
-
-    updatingMemory = false;
-return memory;
-}
+} 
 }
    
    //------------------------------------------
