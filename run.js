@@ -1,16 +1,20 @@
 (() => {
     console.log("🧠 Zeta Memory Loaded v0.0.1");
 
+const roomId = location.pathname.split("/").pop();
+
+console.log("Room ID:", roomId);
+    
     // 이미 실행 중이면 중복 생성 방지
     if (document.getElementById("zeta-memory-panel")) return;
 
     const panel = document.createElement("div");
-    panel.id = "zeta-memory-panel";
-
     panel.innerHTML = `
-        <div style="font-weight:bold;">🧠 Zeta Memory</div>
-        <div>v0.0.1</div>
-    `;
+    <div style="font-weight:bold;">🧠 Zeta Memory</div>
+    <div>v0.0.2</div>
+    <div style="margin-top:6px;">Room</div>
+    <div>${roomId}</div>
+`;
 
     Object.assign(panel.style, {
         position: "fixed",
