@@ -32,3 +32,25 @@ console.log("Room ID:", roomId);
 
     document.body.appendChild(panel);
 })();
+function getMessages() {
+    const result = [];
+
+    document.querySelectorAll(".bg-bubble-user, .bg-gray-sub1").forEach(bubble => {
+        const role = bubble.classList.contains("bg-bubble-user")
+            ? "user"
+            : "assistant";
+
+        const chat = bubble.querySelector(".chat");
+
+        if (!chat) return;
+
+        result.push({
+            role,
+            text: chat.innerText.trim()
+        });
+    });
+
+    return result;
+}
+
+console.log(getMessages());
