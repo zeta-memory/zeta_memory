@@ -169,38 +169,26 @@ function saveProfile(profile) {
 
 }
 
-   async function callOpenAI(prompt) {
+ async function callOpenAI(prompt) {
 
     const profile = getProfile();
 
-    if (!profile) {
-        alert("프로필이 없습니다.");
-        return;
-    }
+    ...
 
- const url =
-    profile.provider === "cerebras"
-        ? "https://api.cerebras.ai/v1/chat/completions"
-        : "https://api.openai.com/v1/chat/completions";
-
-const res = await fetch(url, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${profile.apiKey}`
-        },
-        body: JSON.stringify({
-            model: profile.model,
-            messages: [
-                {
-                    role: "user",
-                    content: prompt
-                }
-            ]
-        })
+    const res = await fetch(url, {
+        ...
     });
 
-      async function updateMemory() {
+    const data = await res.json();
+
+    console.log(data);
+
+    return data;
+
+}   // ← 여기서 callOpenAI 끝
+
+
+async function updateMemory() {
 
     const history = getMessages();
 
