@@ -3,7 +3,7 @@
     "use strict";
 
     // ==========================
-    // Zeta Memory v0.2.0
+    // Zeta Memory v0.3.0
     // ==========================
 
     if (window.__ZETA_MEMORY_RUNNING__) {
@@ -13,17 +13,54 @@
 
     window.__ZETA_MEMORY_RUNNING__ = true;
 
-    const VERSION = "0.2.0";
-    const PROFILE_KEY = "zeta-memory-profile";
+    const VERSION = "0.3.0";
+
+    // ---- 전역(브라우저 공용) 키 ----
+    const LEGACY_PROFILE_KEY = "zeta-memory-profile"; // 구버전 단일 프로필
+    const PROFILES_KEY = "zeta-memory-profiles";
+    const ACTIVE_PROFILE_KEY = "zeta-memory-active-profile";
+    const SETTINGS_KEY = "zeta-memory-settings";
+    const USAGE_KEY = "zeta-memory-usage";
+
+    // ---- 방(room) 단위 키 ----
     const roomId = location.pathname.split("/").pop();
     const STORAGE_KEY = `zeta-memory-${roomId}`;
     const MEMORY_KEY = `${STORAGE_KEY}-memory`;
-    const MEMORY_LENGTH_KEY = `${STORAGE_KEY}-memory-length`; // 하위 호환용(표시만)
-    const MEMORY_INDEX_KEY = `${STORAGE_KEY}-memory-index`;   // 마지막 Memory 생성 시점의 메시지 개수
+    const MEMORY_INDEX_KEY = `${STORAGE_KEY}-memory-index`;
+    const MEMORY_LENGTH_KEY = `${STORAGE_KEY}-memory-length`;
+    const MEMORY_UPDATED_AT_KEY = `${STORAGE_KEY}-memory-updated-at`;
+    const LOCKS_KEY = `${STORAGE_KEY}-locks`;
+    const LOG_KEY = `${STORAGE_KEY}-log`;
 
-    // ---- 튜닝 가능한 값 ----
-    const MEMORY_UPDATE_DELTA_CHARS = 5000; // 이 정도 새 대화가 쌓여야 재생성
-    const MEMORY_DEBOUNCE_MS = 5000;        // 마지막 변화 후 조용해야 하는 시간
+    const MEMORY_TAG = "[장기 기억]";
+    const STREAM_URL_RE = /\/v1\/rooms\/[^/]+\/messages\/stream(?:\?|$)/;
+
+    const DEFAULT_PROMPT = `현재까지의 대화를 장기 기억으로 요약하세요.
+
+규칙
+- 추측하지 마세요.
+- 장소가 명시되지 않았다면 이전 장소를 유지하세요.
+- 앞으로 일어날 일을 예측하지 마세요.
+- 확정된 사실만 기록하세요.
+- 관계 변화는 유지하세요.
+- 감정 변화는 유지하세요.
+- 반복되는 사건은 제거하세요.
+- 1200자 이내.
+
+아래 형식을 반드시 그대로 지켜서 작성하세요 (라벨과 콜론(:) 포함):
+
+현재 장소: ...
+현재 관계: ...
+현재 상황: ...
+중요 설정: ...`;
+
+    const DEFAULT_SETTINGS = {
+        deltaChars: 5000,
+        debounceMs: 5000,
+        autoMemory: true,
+        autoInject: true,
+        prompt: DEFAULT_PROMPT
+    };
 
     let updatingMemory = false;
     let memoryDebounceTimer = null;
@@ -31,8 +68,211 @@
     console.log(`🧠 Zeta Memory v${VERSION}`);
 
     //------------------------------------------
-    // UI
+    // Settings
     //------------------------------------------
+
+    function getSettings() {
+        let raw = null;
+        try {
+            raw = JSON.parse(localStorage.getItem(SETTINGS_KEY));
+        } catch { /* ignore */ }
+        return Object.assign({}, DEFAULT_SETTINGS, raw || {});
+    }
+
+    function saveSettings(patch) {
+        const merged = Object.assign({}, getSettings(), patch);
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
+        return merged;
+    }
+
+    function resetPrompt() {
+        return saveSettings({ prompt: DEFAULT_PROMPT });
+    }
+
+    //------------------------------------------
+    // Profiles (여러 개 저장/선택/수정/삭제)
+    //------------------------------------------
+
+    function migrateLegacyProfile() {
+
+        const raw = localStorage.getItem(LEGACY_PROFILE_KEY);
+        if (!raw) return;
+
+        try {
+            const legacy = JSON.parse(raw);
+            const profiles = getProfilesRaw();
+
+            if (profiles.length === 0 && legacy && legacy.apiKey) {
+                const id = "legacy-" + Date.now();
+                profiles.push({
+                    id,
+                    name: legacy.profileName || "기본",
+                    provider: legacy.provider || "cerebras",
+                    model: legacy.model || "gpt-oss-120b",
+                    apiKey: legacy.apiKey
+                });
+                localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+                localStorage.setItem(ACTIVE_PROFILE_KEY, id);
+            }
+        } catch { /* ignore malformed legacy data */ }
+
+        localStorage.removeItem(LEGACY_PROFILE_KEY);
+    }
+
+    function getProfilesRaw() {
+        try {
+            const arr = JSON.parse(localStorage.getItem(PROFILES_KEY));
+            return Array.isArray(arr) ? arr : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function getProfiles() {
+        return getProfilesRaw();
+    }
+
+    function saveProfiles(list) {
+        localStorage.setItem(PROFILES_KEY, JSON.stringify(list));
+    }
+
+    function getActiveProfileId() {
+        return localStorage.getItem(ACTIVE_PROFILE_KEY) || "";
+    }
+
+    function setActiveProfileId(id) {
+        localStorage.setItem(ACTIVE_PROFILE_KEY, id);
+    }
+
+    function getActiveProfile() {
+        const profiles = getProfiles();
+        if (profiles.length === 0) return null;
+        const activeId = getActiveProfileId();
+        return profiles.find(p => p.id === activeId) || profiles[0];
+    }
+
+    function addProfile({ name, provider, model, apiKey }) {
+        const profiles = getProfiles();
+        const id = "profile-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+        profiles.push({ id, name, provider, model, apiKey });
+        saveProfiles(profiles);
+        if (profiles.length === 1) setActiveProfileId(id);
+        return id;
+    }
+
+    function updateProfile(id, patch) {
+        const profiles = getProfiles();
+        const idx = profiles.findIndex(p => p.id === id);
+        if (idx === -1) return;
+        profiles[idx] = Object.assign({}, profiles[idx], patch);
+        saveProfiles(profiles);
+    }
+
+    function deleteProfile(id) {
+        let profiles = getProfiles();
+        profiles = profiles.filter(p => p.id !== id);
+        saveProfiles(profiles);
+        if (getActiveProfileId() === id) {
+            setActiveProfileId(profiles.length > 0 ? profiles[0].id : "");
+        }
+    }
+
+    //------------------------------------------
+    // Usage tracking (대략치, provider가 usage를 안 주면 집계 안 됨)
+    //------------------------------------------
+
+    function todayStr() {
+        return new Date().toISOString().slice(0, 10);
+    }
+
+    function getUsage() {
+        let raw = null;
+        try {
+            raw = JSON.parse(localStorage.getItem(USAGE_KEY));
+        } catch { /* ignore */ }
+
+        if (!raw || raw.date !== todayStr()) {
+            return { date: todayStr(), promptTokens: 0, completionTokens: 0, calls: 0 };
+        }
+        return raw;
+    }
+
+    function recordUsage(usage) {
+        const current = getUsage();
+        current.calls += 1;
+        if (usage) {
+            current.promptTokens += usage.prompt_tokens || 0;
+            current.completionTokens += usage.completion_tokens || 0;
+        }
+        localStorage.setItem(USAGE_KEY, JSON.stringify(current));
+        return current;
+    }
+
+    //------------------------------------------
+    // Log (방 단위 최근 작업 로그)
+    //------------------------------------------
+
+    function getLog() {
+        try {
+            const arr = JSON.parse(localStorage.getItem(LOG_KEY));
+            return Array.isArray(arr) ? arr : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function pushLog(text) {
+        const log = getLog();
+        const time = new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+        log.unshift({ time, text });
+        localStorage.setItem(LOG_KEY, JSON.stringify(log.slice(0, 20)));
+        renderLogPreview();
+    }
+
+    //------------------------------------------
+    // Locks (장소/관계/설정 잠금 - 방 단위)
+    //------------------------------------------
+
+    function getLocks() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(LOCKS_KEY));
+            return Object.assign({ location: false, relationship: false, setting: false }, raw || {});
+        } catch {
+            return { location: false, relationship: false, setting: false };
+        }
+    }
+
+    function saveLocks(locks) {
+        localStorage.setItem(LOCKS_KEY, JSON.stringify(locks));
+    }
+
+    //------------------------------------------
+    // UI - toggle button + main panel
+    //------------------------------------------
+
+    const PANEL_OPEN_KEY = "zeta-memory-panel-open";
+
+    const toggleBtn = document.createElement("div");
+    toggleBtn.id = "zeta-memory-toggle";
+    toggleBtn.textContent = "🧠";
+
+    Object.assign(toggleBtn.style, {
+        position: "fixed",
+        right: "16px",
+        bottom: "80px",
+        width: "36px",
+        height: "36px",
+        lineHeight: "36px",
+        textAlign: "center",
+        background: "#1f1f1f",
+        color: "#fff",
+        borderRadius: "50%",
+        fontSize: "18px",
+        cursor: "pointer",
+        zIndex: 999999,
+        boxShadow: "0 4px 15px rgba(0,0,0,.4)",
+        userSelect: "none"
+    });
 
     const panel = document.createElement("div");
     panel.id = "zeta-memory-panel";
@@ -40,40 +280,73 @@
     Object.assign(panel.style, {
         position: "fixed",
         right: "16px",
-        bottom: "80px",
+        bottom: "124px",
+        width: "240px",
+        maxHeight: "70vh",
+        overflowY: "auto",
         background: "#1f1f1f",
         color: "#fff",
         padding: "12px",
         borderRadius: "12px",
-        fontSize: "13px",
+        fontSize: "12px",
         lineHeight: "1.5",
         fontFamily: "sans-serif",
         zIndex: 999999,
-        boxShadow: "0 4px 15px rgba(0,0,0,.4)"
+        boxShadow: "0 4px 15px rgba(0,0,0,.4)",
+        display: "none"
     });
 
+    const BTN_STYLE = `
+        background:#333;color:#fff;border:none;border-radius:8px;
+        padding:6px 4px;font-size:11px;cursor:pointer;flex:1 1 auto;
+        min-width:70px;
+    `;
+
     panel.innerHTML = `
-<div style="font-weight:bold;font-size:15px;">🧠 Zeta Memory</div>
-<div>v${VERSION}</div>
+<div style="font-weight:bold;font-size:14px;">🧠 Zeta Memory <span style="font-weight:normal;font-size:10px;color:#999;">v${VERSION}</span></div>
 <hr style="margin:8px 0;border-color:#333;">
-<div>Room</div>
-<div id="zm-room">${roomId}</div>
 
-<div style="margin-top:8px;">Messages</div>
-<div id="zm-count">0</div>
+<div style="display:grid;grid-template-columns:auto auto;gap:2px 6px;">
+  <div style="color:#999;">Room</div><div id="zm-room" style="text-align:right;">${roomId.slice(0, 10)}</div>
+  <div style="color:#999;">Profile</div><div id="zm-profile" style="text-align:right;">-</div>
+  <div style="color:#999;">Messages</div><div id="zm-count" style="text-align:right;">0</div>
+  <div style="color:#999;">History 글자수</div><div id="zm-history-chars" style="text-align:right;">0</div>
+  <div style="color:#999;">Memory 글자수</div><div id="zm-memory-chars" style="text-align:right;">0</div>
+  <div style="color:#999;">Memory 갱신</div><div id="zm-memory-time" style="text-align:right;">-</div>
+  <div style="color:#999;">오늘 호출</div><div id="zm-usage" style="text-align:right;">0회</div>
+  <div style="color:#999;">Status</div><div id="zm-status" style="text-align:right;">Idle</div>
+</div>
 
-<div style="margin-top:8px;">Saved</div>
-<div id="zm-saved">0</div>
+<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:10px;">
+  <button id="zm-btn-force" style="${BTN_STYLE}">🔄 강제갱신</button>
+  <button id="zm-btn-view" style="${BTN_STYLE}">📖 보기</button>
+  <button id="zm-btn-edit" style="${BTN_STYLE}">✏ 수정</button>
+  <button id="zm-btn-reset" style="${BTN_STYLE}">🗑 초기화</button>
+  <button id="zm-btn-settings" style="${BTN_STYLE}">⚙ 설정</button>
+  <button id="zm-btn-log" style="${BTN_STYLE}">📋 로그</button>
+  <button id="zm-btn-export" style="${BTN_STYLE}">⬇ Export</button>
+  <button id="zm-btn-import" style="${BTN_STYLE}">⬆ Import</button>
+</div>
 
-<div style="margin-top:8px;">Status</div>
-<div id="zm-status">Idle</div>
+<div id="zm-log-preview" style="margin-top:8px;font-size:10px;color:#aaa;"></div>
 `;
 
+    document.body.appendChild(toggleBtn);
     document.body.appendChild(panel);
 
-    //------------------------------------------
-    // Utils
-    //------------------------------------------
+    function setPanelOpen(open) {
+        panel.style.display = open ? "block" : "none";
+        toggleBtn.style.opacity = open ? "1" : "0.6";
+        sessionStorage.setItem(PANEL_OPEN_KEY, open ? "1" : "0");
+        if (open) refreshPanel();
+    }
+
+    toggleBtn.addEventListener("click", () => {
+        const isOpen = panel.style.display !== "none";
+        setPanelOpen(!isOpen);
+    });
+
+    setPanelOpen(sessionStorage.getItem(PANEL_OPEN_KEY) === "1");
 
     function setStatus(text) {
         const el = document.getElementById("zm-status");
@@ -85,9 +358,103 @@
         if (el) el.textContent = n;
     }
 
-    function setSaved(n) {
-        const el = document.getElementById("zm-saved");
-        if (el) el.textContent = n;
+    function refreshPanel() {
+
+        const el = (id) => document.getElementById(id);
+
+        const profile = getActiveProfile();
+        if (el("zm-profile")) el("zm-profile").textContent = profile ? profile.name : "(없음)";
+
+        const history = getMessages();
+        const historyChars = buildConversation(history).length;
+        if (el("zm-history-chars")) el("zm-history-chars").textContent = historyChars.toLocaleString();
+
+        const memory = getMemory();
+        if (el("zm-memory-chars")) el("zm-memory-chars").textContent = memory.length.toLocaleString();
+
+        const updatedAt = Number(localStorage.getItem(MEMORY_UPDATED_AT_KEY) || 0);
+        if (el("zm-memory-time")) {
+            el("zm-memory-time").textContent = updatedAt
+                ? new Date(updatedAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })
+                : "-";
+        }
+
+        const usage = getUsage();
+        if (el("zm-usage")) el("zm-usage").textContent = `${usage.calls}회`;
+
+        renderLogPreview();
+    }
+
+    function renderLogPreview() {
+        const el = document.getElementById("zm-log-preview");
+        if (!el) return;
+        const log = getLog().slice(0, 3);
+        el.innerHTML = log.map(l => `${l.time} ${escapeHtml(l.text)}`).join("<br>");
+    }
+
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+    }
+
+    //------------------------------------------
+    // Modal helper (보기/수정/설정/로그/프로필관리 공용)
+    //------------------------------------------
+
+    function openModal(title, bodyNode, { onSave, saveLabel } = {}) {
+
+        const overlay = document.createElement("div");
+        Object.assign(overlay.style, {
+            position: "fixed", inset: "0", background: "rgba(0,0,0,.6)",
+            zIndex: 1000000, display: "flex", alignItems: "flex-end", justifyContent: "center"
+        });
+
+        const sheet = document.createElement("div");
+        Object.assign(sheet.style, {
+            background: "#1f1f1f", color: "#fff", width: "100%", maxWidth: "480px",
+            maxHeight: "85vh", overflowY: "auto", borderRadius: "16px 16px 0 0",
+            padding: "16px", fontFamily: "sans-serif", fontSize: "13px"
+        });
+
+        const header = document.createElement("div");
+        header.style.display = "flex";
+        header.style.justifyContent = "space-between";
+        header.style.alignItems = "center";
+        header.style.marginBottom = "10px";
+        header.innerHTML = `<div style="font-weight:bold;font-size:15px;">${title}</div>`;
+
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "✕";
+        Object.assign(closeBtn.style, { background: "none", border: "none", color: "#fff", fontSize: "18px", cursor: "pointer" });
+        closeBtn.addEventListener("click", () => overlay.remove());
+        header.appendChild(closeBtn);
+
+        sheet.appendChild(header);
+        sheet.appendChild(bodyNode);
+
+        if (onSave) {
+            const saveBtn = document.createElement("button");
+            saveBtn.textContent = saveLabel || "저장";
+            Object.assign(saveBtn.style, {
+                marginTop: "12px", width: "100%", padding: "10px", background: "#4a7dff",
+                color: "#fff", border: "none", borderRadius: "8px", fontSize: "13px", cursor: "pointer"
+            });
+            saveBtn.addEventListener("click", () => {
+                onSave();
+                overlay.remove();
+            });
+            sheet.appendChild(saveBtn);
+        }
+
+        overlay.appendChild(sheet);
+        overlay.addEventListener("click", (e) => {
+            if (e.target === overlay) overlay.remove();
+        });
+
+        document.body.appendChild(overlay);
+        return overlay;
     }
 
     //------------------------------------------
@@ -102,20 +469,14 @@
             .querySelectorAll(".bg-bubble-user, .bg-gray-sub1")
             .forEach(bubble => {
 
-                const role = bubble.classList.contains("bg-bubble-user")
-                    ? "user"
-                    : "assistant";
-
+                const role = bubble.classList.contains("bg-bubble-user") ? "user" : "assistant";
                 const chat = bubble.querySelector(".chat");
-
                 if (!chat) return;
 
                 const text = chat.innerText.trim();
-
                 if (!text) return;
 
                 result.push({ role, text });
-
             });
 
         setCount(result.length);
@@ -131,84 +492,85 @@
 
         const list = messages || getMessages();
 
-        const data = {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
             roomId,
             updatedAt: Date.now(),
             messages: list
-        };
-
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-
-        setSaved(list.length);
+        }));
 
         console.log("✅ Saved", list.length);
+        pushLog(`Saved (${list.length})`);
 
         return list;
     }
 
     //------------------------------------------
-    // Profile
+    // LLM Call (재시도 + 429 대기 포함)
     //------------------------------------------
 
-    function getProfile() {
+    async function callOpenAI(prompt, { retries = 3 } = {}) {
 
-        const raw = localStorage.getItem(PROFILE_KEY);
-
-        if (!raw) return null;
-
-        try {
-            return JSON.parse(raw);
-        } catch {
-            return null;
-        }
-    }
-
-    function saveProfile(profile) {
-        localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
-    }
-
-    //------------------------------------------
-    // LLM Call
-    //------------------------------------------
-
-    async function callOpenAI(prompt) {
-
-        const profile = getProfile();
+        const profile = getActiveProfile();
 
         if (!profile) {
-            alert("프로필이 없습니다.");
-            return;
+            alert("사용할 프로필이 없습니다. 설정에서 프로필을 추가해주세요.");
+            throw new Error("NO_PROFILE");
         }
 
         const url =
             profile.provider === "cerebras"
                 ? "https://api.cerebras.ai/v1/chat/completions"
-                : "https://api.openai.com/v1/chat/completions";
+                : profile.provider === "openrouter"
+                    ? "https://openrouter.ai/api/v1/chat/completions"
+                    : "https://api.openai.com/v1/chat/completions";
 
-        const res = await fetch(url, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${profile.apiKey}`
-            },
-            body: JSON.stringify({
-                model: profile.model,
-                messages: [
-                    { role: "user", content: prompt }
-                ]
-            })
-        });
+        let lastError = null;
 
-        if (!res.ok) {
-            const errText = await res.text().catch(() => "");
-            throw new Error(`API 오류 ${res.status}: ${errText}`);
+        for (let attempt = 0; attempt <= retries; attempt++) {
+
+            try {
+
+                const res = await fetch(url, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${profile.apiKey}`
+                    },
+                    body: JSON.stringify({
+                        model: profile.model,
+                        messages: [{ role: "user", content: prompt }]
+                    })
+                });
+
+                if (res.status === 429) {
+                    const waitMs = Math.min(30000, 2000 * Math.pow(2, attempt));
+                    pushLog(`429 재시도 대기 ${Math.round(waitMs / 1000)}s`);
+                    await new Promise(r => setTimeout(r, waitMs));
+                    continue;
+                }
+
+                if (!res.ok) {
+                    const errText = await res.text().catch(() => "");
+                    throw new Error(`API 오류 ${res.status}: ${errText}`);
+                }
+
+                const data = await res.json();
+                console.log(data);
+
+                if (data.usage) recordUsage(data.usage);
+
+                return data.choices[0].message.content;
+
+            } catch (err) {
+                lastError = err;
+                if (attempt < retries) {
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                }
+            }
         }
 
-        const data = await res.json();
-
-        console.log(data);
-
-        return data.choices[0].message.content;
+        pushLog("API Error");
+        throw lastError || new Error("API 호출 실패");
     }
 
     //------------------------------------------
@@ -219,20 +581,57 @@
         return localStorage.getItem(MEMORY_KEY) || "";
     }
 
+    function buildConversation(messages) {
+        return messages.map(m => `${m.role.toUpperCase()}\n${m.text}`).join("\n\n");
+    }
+
     function getMemoryIndex() {
         return Number(localStorage.getItem(MEMORY_INDEX_KEY) || 0);
     }
 
-    function buildConversation(messages) {
-        return messages
-            .map(m => `${m.role.toUpperCase()}\n${m.text}`)
-            .join("\n\n");
+    const FIELD_LABELS = ["현재 장소", "현재 관계", "현재 상황", "중요 설정"];
+
+    function parseMemoryFields(text) {
+
+        const fields = { location: "", relationship: "", situation: "", setting: "" };
+        const keys = ["location", "relationship", "situation", "setting"];
+
+        if (!text) return fields;
+
+        for (let i = 0; i < FIELD_LABELS.length; i++) {
+            const label = FIELD_LABELS[i];
+            const rest = FIELD_LABELS.slice(i + 1).map(l => l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+            const lookahead = rest.length ? `(?:${rest.join("|")})\\s*[:：]|$` : "$";
+            const pattern = new RegExp(label + "\\s*[:：]\\s*([\\s\\S]*?)(?=" + lookahead + ")");
+            const m = text.match(pattern);
+            fields[keys[i]] = m ? m[1].trim() : "";
+        }
+
+        return fields;
+    }
+
+    function buildMemoryText(fields) {
+        return `현재 장소: ${fields.location}\n현재 관계: ${fields.relationship}\n현재 상황: ${fields.situation}\n중요 설정: ${fields.setting}`;
+    }
+
+    function applyLocks(newText, previousText, locks) {
+
+        if (!locks.location && !locks.relationship && !locks.setting) return newText;
+
+        const newFields = parseMemoryFields(newText);
+        const prevFields = parseMemoryFields(previousText);
+
+        if (locks.location && prevFields.location) newFields.location = prevFields.location;
+        if (locks.relationship && prevFields.relationship) newFields.relationship = prevFields.relationship;
+        if (locks.setting && prevFields.setting) newFields.setting = prevFields.setting;
+
+        return buildMemoryText(newFields);
     }
 
     // 증분(incremental) 업데이트: 이전 Memory + 그 이후 새 대화만 LLM에 전달
     async function updateMemory() {
 
-        if (updatingMemory) return;
+        if (updatingMemory) return getMemory();
 
         updatingMemory = true;
         setStatus("Memory 생성 중...");
@@ -250,30 +649,9 @@
 
             const previousMemory = getMemory();
             const deltaConversation = buildConversation(deltaMessages);
+            const settings = getSettings();
 
-            const prompt = `
-당신은 롤플레이/대화의 장기 기억(Memory)을 관리합니다.
-
-아래에는 "이전 Memory"와 "그 이후 새로 추가된 대화"가 주어집니다.
-이전 Memory를 기반으로 새 정보만 반영하여 Memory를 갱신하세요.
-
-규칙
-- 추측하지 마세요.
-- 새 대화에서 명시적으로 바뀌지 않은 항목(장소, 관계, 설정 등)은 이전 Memory의 값을 그대로 유지하세요.
-- 장소가 명시되지 않았다면 이전 장소를 유지하세요.
-- 앞으로 일어날 일을 예측하지 마세요.
-- 확정된 사실만 기록하세요.
-- 장소는 현재 장소만 유지하세요.
-- 관계 변화는 유지하세요.
-- 감정 변화는 유지하세요.
-- 반복되는 사건은 제거하세요.
-- 1200자 이내.
-- 항목은
-  현재 장소
-  현재 관계
-  현재 상황
-  중요 설정
-만 작성하세요.
+            const prompt = `${settings.prompt}
 
 [이전 Memory]
 ${previousMemory || "(없음, 최초 생성)"}
@@ -282,24 +660,25 @@ ${previousMemory || "(없음, 최초 생성)"}
 ${deltaConversation}
 `;
 
-            const memory = await callOpenAI(prompt);
+            let memory = await callOpenAI(prompt);
+
+            const locks = getLocks();
+            memory = applyLocks(memory, previousMemory, locks);
 
             localStorage.setItem(MEMORY_KEY, memory);
             localStorage.setItem(MEMORY_INDEX_KEY, history.length);
-            localStorage.setItem(
-                MEMORY_LENGTH_KEY,
-                buildConversation(history).length
-            );
+            localStorage.setItem(MEMORY_LENGTH_KEY, buildConversation(history).length);
+            localStorage.setItem(MEMORY_UPDATED_AT_KEY, Date.now());
 
             setStatus("Memory 갱신 완료");
+            pushLog("Memory Updated");
+            refreshPanel();
 
             return memory;
 
         } catch (err) {
-
             console.error("❌ Memory 갱신 실패", err);
             setStatus("Memory 갱신 실패 (콘솔 확인)");
-
         } finally {
             updatingMemory = false;
         }
@@ -307,12 +686,15 @@ ${deltaConversation}
 
     function maybeUpdateMemory() {
 
+        const settings = getSettings();
+        if (!settings.autoMemory) return;
+
         const history = getMessages();
         const lastIndex = getMemoryIndex();
         const deltaMessages = history.slice(lastIndex);
         const deltaChars = buildConversation(deltaMessages).length;
 
-        if (deltaChars >= MEMORY_UPDATE_DELTA_CHARS) {
+        if (deltaChars >= settings.deltaChars) {
             updateMemory();
         } else {
             setStatus("대기 중 (변화량 부족)");
@@ -320,48 +702,25 @@ ${deltaConversation}
     }
 
     //------------------------------------------
-    // Change detection (스크롤로 인한 과거 메시지 로딩과
-    // 실제 새 메시지를 구분한다)
+    // Change detection (스크롤 로딩 vs 실제 새 메시지 구분)
     //------------------------------------------
 
-    let lastSignature = null; // { count, role, len, head }
+    let lastSignature = null;
 
     function getSignature(messages) {
-
-        if (messages.length === 0) {
-            return { count: 0, role: "", len: 0, head: "" };
-        }
-
+        if (messages.length === 0) return { count: 0, role: "", len: 0, head: "" };
         const last = messages[messages.length - 1];
-
-        return {
-            count: messages.length,
-            role: last.role,
-            len: last.text.length,
-            head: last.text.slice(0, 50)
-        };
+        return { count: messages.length, role: last.role, len: last.text.length, head: last.text.slice(0, 50) };
     }
 
     function sameSignature(a, b) {
-        return (
-            a.count === b.count &&
-            a.role === b.role &&
-            a.len === b.len &&
-            a.head === b.head
-        );
+        return a.count === b.count && a.role === b.role && a.len === b.len && a.head === b.head;
     }
 
-    // 과거 메시지가 스크롤로 새로 DOM에 붙는 경우:
-    // 메시지 개수는 바뀌지만 "마지막" 메시지는 그대로다.
-    // 반대로 실제 새 메시지가 오면 마지막 메시지 자체가 바뀐다.
     function isRealNewMessage(current, previous) {
-        if (!previous) return current.count > 0; // 최초 로드
+        if (!previous) return current.count > 0;
         if (current.count === previous.count) return false;
-        // 마지막 메시지가 동일하면(=앞쪽에 과거 메시지가 붙은 것) 새 메시지 아님
-        const sameTail =
-            current.role === previous.role &&
-            current.len === previous.len &&
-            current.head === previous.head;
+        const sameTail = current.role === previous.role && current.len === previous.len && current.head === previous.head;
         return !sameTail;
     }
 
@@ -374,30 +733,26 @@ ${deltaConversation}
         const messages = getMessages();
         const signature = getSignature(messages);
 
-        if (lastSignature && sameSignature(signature, lastSignature)) {
-            return; // 아무 변화 없음
-        }
+        if (lastSignature && sameSignature(signature, lastSignature)) return;
 
         const isNew = isRealNewMessage(signature, lastSignature);
-
         lastSignature = signature;
 
-        // history는 변화가 있으면 항상 즉시 저장 (스크롤 로딩 포함, 저장 자체는 저렴함)
         saveHistory(messages);
+        refreshPanel();
 
         if (!isNew) {
-            // 과거 메시지가 스크롤로 로드된 것으로 판단 → Memory 타이머는 건드리지 않음
             setStatus("과거 메시지 로드 감지 (Memory 대기 유지)");
             return;
         }
 
         setStatus("새 메시지 감지, 대기 중...");
 
-        // 5초 디바운스: 마지막 변화 후 5초간 조용하면 Memory 갱신 여부 판단
+        const settings = getSettings();
         clearTimeout(memoryDebounceTimer);
         memoryDebounceTimer = setTimeout(() => {
             maybeUpdateMemory();
-        }, MEMORY_DEBOUNCE_MS);
+        }, settings.debounceMs);
     }
 
     //------------------------------------------
@@ -405,13 +760,10 @@ ${deltaConversation}
     //------------------------------------------
 
     const observer = new MutationObserver(() => {
-
         clearTimeout(window.__zetaMemoryTimer__);
-
         window.__zetaMemoryTimer__ = setTimeout(() => {
             autoSave();
         }, 300);
-
     });
 
     observer.observe(document.body, {
@@ -421,45 +773,29 @@ ${deltaConversation}
     });
 
     //------------------------------------------
-    // Context prefix (최종 목표: 요청 앞에 Memory + 사용자 입력 자동 첨부)
+    // Context prefix + fetch 가로채기 (자동 삽입)
     //------------------------------------------
-
-    const AUTO_INJECT_MEMORY = true; // 문제 생기면 false로 끄면 원상복구됨
-    const STREAM_URL_RE = /\/v1\/rooms\/[^/]+\/messages\/stream(?:\?|$)/;
-    const MEMORY_TAG = "[장기 기억]"; // 이미 주입된 요청 재시도 시 중복 방지용 마커
 
     function buildContextPrefix(userInput) {
 
         const memory = getMemory();
-
         if (!memory) return userInput;
-
-        // 이미 한 번 주입된 텍스트라면(재시도 등) 다시 감싸지 않음
         if (userInput.startsWith(MEMORY_TAG)) return userInput;
 
         return `${MEMORY_TAG}\n${memory}\n\n[사용자 입력]\n${userInput}`;
     }
 
-    // Zeta 메시지 전송(stream) 요청을 가로채서 payload.text 앞에
-    // Memory를 자동으로 붙인다.
-    //
-    // 주의: 이 방식은 실제로 서버에 저장되는 메시지 내용 자체를 바꾼다.
-    // Zeta가 채팅 히스토리를 새로고침 시 서버 데이터로 다시 그리는 방식이라면
-    // 내 말풍선에 "[장기 기억] ... [사용자 입력] ..." 형태가 그대로 보일 수 있다.
-    // 문제가 보이면 AUTO_INJECT_MEMORY를 false로 바꿔서 끄고 알려달라.
-    if (AUTO_INJECT_MEMORY) {
+    const originalFetch = window.fetch;
 
-        const originalFetch = window.fetch;
+    window.fetch = async function (input, init) {
 
-        window.fetch = async function (input, init) {
+        try {
 
-            try {
+            const settings = getSettings();
 
-                const url =
-                    typeof input === "string"
-                        ? input
-                        : (input && input.url) || "";
+            if (settings.autoInject) {
 
+                const url = typeof input === "string" ? input : (input && input.url) || "";
                 const method = (
                     (init && init.method) ||
                     (typeof input !== "string" && input && input.method) ||
@@ -471,40 +807,450 @@ ${deltaConversation}
                     const bodyObj = JSON.parse(init.body);
 
                     if (bodyObj && bodyObj.type === "TEXT" && typeof bodyObj.text === "string") {
-
                         bodyObj.text = buildContextPrefix(bodyObj.text);
-
-                        init = Object.assign({}, init, {
-                            body: JSON.stringify(bodyObj)
-                        });
-
+                        init = Object.assign({}, init, { body: JSON.stringify(bodyObj) });
                         console.log("🧠 Memory 주입됨:", bodyObj.text.slice(0, 80) + "...");
+                        pushLog("Memory Injected");
                     }
                 }
-
-            } catch (err) {
-                console.error("❌ Memory 주입 실패, 원본 요청 그대로 전송", err);
             }
 
-            return originalFetch.call(this, input, init);
+        } catch (err) {
+            console.error("❌ Memory 주입 실패, 원본 요청 그대로 전송", err);
+        }
+
+        return originalFetch.call(this, input, init);
+    };
+
+    //------------------------------------------
+    // Export / Import - 방 단위
+    //------------------------------------------
+
+    function downloadJson(obj, filename) {
+        const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    function exportRoom() {
+
+        const data = {
+            kind: "zeta-memory-room-backup",
+            version: VERSION,
+            roomId,
+            exportedAt: Date.now(),
+            history: localStorage.getItem(STORAGE_KEY),
+            memory: localStorage.getItem(MEMORY_KEY),
+            memoryIndex: localStorage.getItem(MEMORY_INDEX_KEY),
+            memoryLength: localStorage.getItem(MEMORY_LENGTH_KEY),
+            memoryUpdatedAt: localStorage.getItem(MEMORY_UPDATED_AT_KEY),
+            locks: localStorage.getItem(LOCKS_KEY),
+            log: localStorage.getItem(LOG_KEY),
+            settings: localStorage.getItem(SETTINGS_KEY)
         };
+
+        downloadJson(data, `zeta-memory-room-${roomId}-${todayStr()}.json`);
+        pushLog("Export 완료 (Room)");
+    }
+
+    function importRoomFile(file) {
+
+        const reader = new FileReader();
+
+        reader.onload = () => {
+
+            try {
+
+                const data = JSON.parse(reader.result);
+
+                if (data.kind !== "zeta-memory-room-backup") {
+                    alert("이 파일은 Room 백업 파일이 아닙니다.");
+                    return;
+                }
+
+                if (!confirm(`현재 방(${roomId})의 데이터를 백업 파일 내용으로 덮어씁니다. 계속할까요?`)) return;
+
+                if (data.history) localStorage.setItem(STORAGE_KEY, data.history);
+                if (data.memory) localStorage.setItem(MEMORY_KEY, data.memory);
+                if (data.memoryIndex) localStorage.setItem(MEMORY_INDEX_KEY, data.memoryIndex);
+                if (data.memoryLength) localStorage.setItem(MEMORY_LENGTH_KEY, data.memoryLength);
+                if (data.memoryUpdatedAt) localStorage.setItem(MEMORY_UPDATED_AT_KEY, data.memoryUpdatedAt);
+                if (data.locks) localStorage.setItem(LOCKS_KEY, data.locks);
+                if (data.log) localStorage.setItem(LOG_KEY, data.log);
+                if (data.settings) localStorage.setItem(SETTINGS_KEY, data.settings);
+
+                pushLog("Import 완료 (Room)");
+                refreshPanel();
+                alert("복원 완료. 새로고침을 권장합니다.");
+
+            } catch (err) {
+                console.error(err);
+                alert("파일을 읽는 중 오류가 발생했습니다.");
+            }
+        };
+
+        reader.readAsText(file);
     }
 
     //------------------------------------------
-    // First Save
+    // Export / Import - 전체 백업 (모든 Room + Profile + 설정)
     //------------------------------------------
 
+    function exportAll() {
+
+        const dump = {};
+
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith("zeta-memory")) {
+                dump[key] = localStorage.getItem(key);
+            }
+        }
+
+        downloadJson(
+            { kind: "zeta-memory-full-backup", version: VERSION, exportedAt: Date.now(), data: dump },
+            `zeta-memory-full-backup-${todayStr()}.json`
+        );
+
+        pushLog("Export 완료 (전체)");
+    }
+
+    function importAllFile(file) {
+
+        const reader = new FileReader();
+
+        reader.onload = () => {
+
+            try {
+
+                const parsed = JSON.parse(reader.result);
+
+                if (parsed.kind !== "zeta-memory-full-backup" || !parsed.data) {
+                    alert("이 파일은 전체 백업 파일이 아닙니다.");
+                    return;
+                }
+
+                if (!confirm("브라우저에 저장된 모든 Zeta Memory 데이터(모든 방, 프로필 포함)를 덮어씁니다. 계속할까요?")) return;
+
+                Object.keys(parsed.data).forEach(key => {
+                    localStorage.setItem(key, parsed.data[key]);
+                });
+
+                alert("전체 복원 완료. 페이지를 새로고침합니다.");
+                location.reload();
+
+            } catch (err) {
+                console.error(err);
+                alert("파일을 읽는 중 오류가 발생했습니다.");
+            }
+        };
+
+        reader.readAsText(file);
+    }
+
+    function pickFile(onPicked) {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "application/json";
+        input.style.display = "none";
+        input.addEventListener("change", () => {
+            if (input.files && input.files[0]) onPicked(input.files[0]);
+            input.remove();
+        });
+        document.body.appendChild(input);
+        input.click();
+    }
+
+    //------------------------------------------
+    // Modal: Memory 보기
+    //------------------------------------------
+
+    function showMemoryViewModal() {
+        const body = document.createElement("div");
+        const pre = document.createElement("pre");
+        pre.style.whiteSpace = "pre-wrap";
+        pre.style.wordBreak = "break-word";
+        pre.style.background = "#111";
+        pre.style.padding = "10px";
+        pre.style.borderRadius = "8px";
+        pre.style.maxHeight = "50vh";
+        pre.style.overflowY = "auto";
+        pre.textContent = getMemory() || "(저장된 Memory가 없습니다)";
+        body.appendChild(pre);
+        openModal("📖 Memory 보기", body);
+    }
+
+    //------------------------------------------
+    // Modal: Memory 수정
+    //------------------------------------------
+
+    function showMemoryEditModal() {
+        const body = document.createElement("div");
+        const textarea = document.createElement("textarea");
+        Object.assign(textarea.style, {
+            width: "100%", height: "40vh", background: "#111", color: "#fff",
+            border: "1px solid #444", borderRadius: "8px", padding: "8px", fontSize: "13px",
+            boxSizing: "border-box"
+        });
+        textarea.value = getMemory();
+        body.appendChild(textarea);
+
+        openModal("✏ Memory 수정", body, {
+            saveLabel: "저장",
+            onSave: () => {
+                localStorage.setItem(MEMORY_KEY, textarea.value);
+                localStorage.setItem(MEMORY_UPDATED_AT_KEY, Date.now());
+                pushLog("Memory 수동 수정");
+                refreshPanel();
+            }
+        });
+    }
+
+    //------------------------------------------
+    // Modal: 로그
+    //------------------------------------------
+
+    function showLogModal() {
+        const body = document.createElement("div");
+        const log = getLog();
+        body.innerHTML = log.length
+            ? log.map(l => `<div style="padding:4px 0;border-bottom:1px solid #333;">${l.time} &nbsp; ${escapeHtml(l.text)}</div>`).join("")
+            : "<div>로그가 없습니다.</div>";
+        openModal("📋 최근 로그", body);
+    }
+
+    //------------------------------------------
+    // Modal: 설정 (Settings)
+    //------------------------------------------
+
+    function showSettingsModal() {
+
+        const settings = getSettings();
+        const locks = getLocks();
+        const profiles = getProfiles();
+        const activeId = getActiveProfileId();
+
+        const body = document.createElement("div");
+        body.innerHTML = `
+<div style="font-weight:bold;margin-bottom:6px;">프로필</div>
+<select id="zm-profile-select" style="width:100%;padding:6px;background:#111;color:#fff;border:1px solid #444;border-radius:6px;">
+  ${profiles.map(p => `<option value="${p.id}" ${p.id === activeId ? "selected" : ""}>${escapeHtml(p.name)} (${escapeHtml(p.provider)})</option>`).join("")}
+</select>
+<div style="display:flex;gap:6px;margin-top:6px;">
+  <button id="zm-profile-add" style="${BTN_STYLE}">+ 새 프로필</button>
+  <button id="zm-profile-edit" style="${BTN_STYLE}">✏ 수정</button>
+  <button id="zm-profile-del" style="${BTN_STYLE}">🗑 삭제</button>
+</div>
+
+<hr style="margin:12px 0;border-color:#333;">
+
+<div style="font-weight:bold;margin-bottom:6px;">자동 동작</div>
+<label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
+  <input type="checkbox" id="zm-auto-memory" ${settings.autoMemory ? "checked" : ""}> 자동 Memory 생성
+</label>
+<label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
+  <input type="checkbox" id="zm-auto-inject" ${settings.autoInject ? "checked" : ""}> 자동 Memory 삽입
+</label>
+
+<div style="margin-top:8px;">Memory 생성 기준 글자수</div>
+<input id="zm-delta-chars" type="number" value="${settings.deltaChars}" style="width:100%;padding:6px;background:#111;color:#fff;border:1px solid #444;border-radius:6px;">
+
+<div style="margin-top:8px;">Debounce 시간 (ms)</div>
+<input id="zm-debounce" type="number" value="${settings.debounceMs}" style="width:100%;padding:6px;background:#111;color:#fff;border:1px solid #444;border-radius:6px;">
+
+<hr style="margin:12px 0;border-color:#333;">
+
+<div style="font-weight:bold;margin-bottom:6px;">Memory Lock (이 방)</div>
+<label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
+  <input type="checkbox" id="zm-lock-location" ${locks.location ? "checked" : ""}> 장소 잠금
+</label>
+<label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
+  <input type="checkbox" id="zm-lock-relationship" ${locks.relationship ? "checked" : ""}> 관계 잠금
+</label>
+<label style="display:flex;align-items:center;gap:6px;margin:4px 0;">
+  <input type="checkbox" id="zm-lock-setting" ${locks.setting ? "checked" : ""}> 세계관/설정 잠금
+</label>
+
+<hr style="margin:12px 0;border-color:#333;">
+
+<div style="font-weight:bold;margin-bottom:6px;">Memory 생성 Prompt</div>
+<textarea id="zm-prompt" style="width:100%;height:30vh;background:#111;color:#fff;border:1px solid #444;border-radius:6px;padding:8px;font-size:12px;box-sizing:border-box;">${escapeHtml(settings.prompt)}</textarea>
+<button id="zm-prompt-reset" style="${BTN_STYLE};margin-top:6px;width:100%;">Prompt 초기화</button>
+`;
+
+        body.querySelector("#zm-profile-add").addEventListener("click", () => {
+            const name = prompt("프로필 이름", "새 프로필");
+            if (name === null) return;
+            const provider = prompt("Provider (cerebras / openai / openrouter)", "cerebras");
+            if (provider === null) return;
+            const model = prompt("모델", "gpt-oss-120b");
+            if (model === null) return;
+            const apiKey = prompt("API Key");
+            if (apiKey === null) return;
+            const id = addProfile({ name, provider, model, apiKey });
+            setActiveProfileId(id);
+            overlay.remove();
+            showSettingsModal();
+        });
+
+        body.querySelector("#zm-profile-edit").addEventListener("click", () => {
+            const select = body.querySelector("#zm-profile-select");
+            const id = select.value;
+            const p = profiles.find(pr => pr.id === id);
+            if (!p) return;
+            const name = prompt("프로필 이름", p.name);
+            if (name === null) return;
+            const provider = prompt("Provider", p.provider);
+            if (provider === null) return;
+            const model = prompt("모델", p.model);
+            if (model === null) return;
+            const apiKey = prompt("API Key (비워두면 기존 값 유지)", "");
+            updateProfile(id, { name, provider, model, apiKey: apiKey || p.apiKey });
+            overlay.remove();
+            showSettingsModal();
+        });
+
+        body.querySelector("#zm-profile-del").addEventListener("click", () => {
+            const select = body.querySelector("#zm-profile-select");
+            const id = select.value;
+            if (!confirm("이 프로필을 삭제할까요?")) return;
+            deleteProfile(id);
+            overlay.remove();
+            showSettingsModal();
+        });
+
+        body.querySelector("#zm-prompt-reset").addEventListener("click", () => {
+            body.querySelector("#zm-prompt").value = DEFAULT_PROMPT;
+        });
+
+        var overlay = openModal("⚙ 설정", body, {
+            saveLabel: "설정 저장",
+            onSave: () => {
+
+                setActiveProfileId(body.querySelector("#zm-profile-select").value);
+
+                saveSettings({
+                    autoMemory: body.querySelector("#zm-auto-memory").checked,
+                    autoInject: body.querySelector("#zm-auto-inject").checked,
+                    deltaChars: Number(body.querySelector("#zm-delta-chars").value) || DEFAULT_SETTINGS.deltaChars,
+                    debounceMs: Number(body.querySelector("#zm-debounce").value) || DEFAULT_SETTINGS.debounceMs,
+                    prompt: body.querySelector("#zm-prompt").value || DEFAULT_PROMPT
+                });
+
+                saveLocks({
+                    location: body.querySelector("#zm-lock-location").checked,
+                    relationship: body.querySelector("#zm-lock-relationship").checked,
+                    setting: body.querySelector("#zm-lock-setting").checked
+                });
+
+                pushLog("설정 저장");
+                refreshPanel();
+            }
+        });
+    }
+
+    //------------------------------------------
+    // Button wiring
+    //------------------------------------------
+
+    document.getElementById("zm-btn-force").addEventListener("click", async () => {
+        setStatus("강제 갱신 중...");
+        await updateMemory();
+        refreshPanel();
+    });
+
+    document.getElementById("zm-btn-view").addEventListener("click", showMemoryViewModal);
+    document.getElementById("zm-btn-edit").addEventListener("click", showMemoryEditModal);
+
+    document.getElementById("zm-btn-reset").addEventListener("click", () => {
+        if (!confirm("이 방의 Memory를 초기화할까요? (History는 유지됩니다)")) return;
+        localStorage.removeItem(MEMORY_KEY);
+        localStorage.removeItem(MEMORY_INDEX_KEY);
+        localStorage.removeItem(MEMORY_LENGTH_KEY);
+        localStorage.removeItem(MEMORY_UPDATED_AT_KEY);
+        pushLog("Memory 초기화");
+        refreshPanel();
+    });
+
+    document.getElementById("zm-btn-settings").addEventListener("click", showSettingsModal);
+    document.getElementById("zm-btn-log").addEventListener("click", showLogModal);
+
+    // 짧게 탭: 방 단위 백업 / 0.6초 이상 길게 누르기(모바일) or 우클릭(PC): 전체 백업
+    (function wireExportButton() {
+
+        const btn = document.getElementById("zm-btn-export");
+        let pressTimer = null;
+        let longPressed = false;
+
+        const startPress = () => {
+            longPressed = false;
+            pressTimer = setTimeout(() => {
+                longPressed = true;
+                if (confirm("전체 백업(모든 방 + 프로필)을 내보낼까요?")) exportAll();
+            }, 600);
+        };
+
+        const cancelPress = () => {
+            clearTimeout(pressTimer);
+        };
+
+        btn.addEventListener("touchstart", startPress, { passive: true });
+        btn.addEventListener("touchend", cancelPress);
+        btn.addEventListener("touchmove", cancelPress);
+        btn.addEventListener("mousedown", startPress);
+        btn.addEventListener("mouseup", cancelPress);
+        btn.addEventListener("mouseleave", cancelPress);
+
+        btn.addEventListener("contextmenu", (e) => e.preventDefault());
+
+        btn.addEventListener("click", () => {
+            if (longPressed) return; // 롱프레스로 이미 처리됨
+            exportRoom();
+        });
+    })();
+
+    document.getElementById("zm-btn-import").addEventListener("click", () => {
+        pickFile((file) => {
+            file.text().then(text => {
+                try {
+                    const parsed = JSON.parse(text);
+                    if (parsed.kind === "zeta-memory-full-backup") {
+                        importAllFile(file);
+                    } else {
+                        importRoomFile(file);
+                    }
+                } catch {
+                    alert("올바른 JSON 파일이 아닙니다.");
+                }
+            });
+        });
+    });
+
+    //------------------------------------------
+    // First Save / Profile setup
+    //------------------------------------------
+
+    migrateLegacyProfile();
+
+    if (getProfiles().length === 0) {
+        setupProfile();
+    }
+
     autoSave();
-    setupProfile();
+    refreshPanel();
 
     function setupProfile() {
-
-        if (getProfile()) return;
 
         const profileName = prompt("프로필 이름", "기본");
         if (profileName === null) return;
 
-        const provider = prompt("Provider\n(cerebras)", "cerebras");
+        const provider = prompt("Provider\n(cerebras / openai / openrouter)", "cerebras");
         if (provider === null) return;
 
         const model = prompt("모델", "gpt-oss-120b");
@@ -513,9 +1259,11 @@ ${deltaConversation}
         const apiKey = prompt("API Key");
         if (apiKey === null) return;
 
-        saveProfile({ profileName, provider, model, apiKey });
+        const id = addProfile({ name: profileName, provider, model, apiKey });
+        setActiveProfileId(id);
 
         console.log("✅ Profile Saved");
+        pushLog("프로필 생성");
     }
 
     //------------------------------------------
@@ -528,12 +1276,24 @@ ${deltaConversation}
         getMessages,
         saveHistory,
         autoSave,
-        getProfile,
+        getProfiles,
+        addProfile,
+        updateProfile,
+        deleteProfile,
+        getActiveProfile,
+        setActiveProfileId,
+        getSettings,
+        saveSettings,
         callOpenAI,
         updateMemory,
         maybeUpdateMemory,
         getMemory,
+        getLocks,
+        saveLocks,
         buildContextPrefix,
+        exportRoom,
+        exportAll,
+        getLog,
         observer
     };
 
