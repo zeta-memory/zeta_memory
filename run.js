@@ -254,9 +254,10 @@ localStorage.setItem(
 
 updatingMemory = false;
 
+setStatus("Memory Updated");
+
 return memory;
 
-} 
 }
    
    //------------------------------------------
