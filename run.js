@@ -178,7 +178,12 @@ function saveProfile(profile) {
         return;
     }
 
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+ const url =
+    profile.provider === "cerebras"
+        ? "https://api.cerebras.ai/v1/chat/completions"
+        : "https://api.openai.com/v1/chat/completions";
+
+const res = await fetch(url, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -264,7 +269,7 @@ function setupProfile() {
     if (profileName === null) return;
 
     const provider = prompt(
-        "Provider\n(openai/openrouter)",
+        "Provider\n(cerebras)",
         "openai"
     );
 
@@ -272,7 +277,7 @@ function setupProfile() {
 
     const model = prompt(
         "모델",
-        "gpt-5.5-nano"
+        "gpt-oss-120b"
     );
 
     if (model === null) return;
