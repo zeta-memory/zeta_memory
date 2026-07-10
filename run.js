@@ -202,9 +202,38 @@ async function callOpenAI(prompt) {
 
     const data = await res.json();
 
-    console.log(data);
+   console.log(data);
 
-    return data;
+return data.choices[0].message.content;
+}
+
+   async function updateMemory() {
+
+    const history = getMessages();
+
+    const conversation = history.map(m =>
+        `${m.role.toUpperCase()}\n${m.text}`
+    ).join("\n\n");
+
+    const prompt = `
+현재까지의 대화를 장기 기억으로 요약하세요.
+
+규칙
+
+- 현재 상황만 남긴다.
+- 반복되는 대화는 제거한다.
+- 장소를 유지한다.
+- 관계를 유지한다.
+- 앞으로 RP에 필요한 정보만 남긴다.
+- 1500자 이내.
+
+대화
+
+${conversation}
+`;
+
+    return await callOpenAI(prompt);
+
 }
    
    
@@ -237,10 +266,7 @@ async function callOpenAI(prompt) {
         window.__zetaMemoryTimer__ = setTimeout(() => {
 
             autoSave();
-
-            setupProfile();
-
-      
+                    
 
         }, 300);
 
@@ -257,6 +283,7 @@ async function callOpenAI(prompt) {
     //------------------------------------------
 
     autoSave();
+    setupProfile();
 
     //------------------------------------------
     // Public API
@@ -316,11 +343,15 @@ function setupProfile() {
 
         autoSave,
 
+         getProfile,
+
        callOpenAI,
 
        updateMemory,
 
         observer
+
+     
 
     };
 
