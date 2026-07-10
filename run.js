@@ -200,6 +200,39 @@ const res = await fetch(url, {
         })
     });
 
+      async function updateMemory() {
+
+    const history = getMessages();
+
+    const conversation = history.map(m => {
+
+        return `${m.role.toUpperCase()}\n${m.text}`;
+
+    }).join("\n\n");
+
+    const prompt = `
+
+현재까지의 대화를 장기 기억으로 요약하세요.
+
+규칙
+
+- 현재 상황만 남긴다.
+- 반복되는 대화는 제거한다.
+- 현재 장소를 유지한다.
+- 현재 관계를 유지한다.
+- 앞으로 RP를 이어가기 위해 필요한 정보만 남긴다.
+- 1500자 이내.
+
+대화
+
+${conversation}
+
+`;
+
+    return await callOpenAI(prompt);
+
+}
+
     const data = await res.json();
 
     console.log(data);
@@ -315,6 +348,8 @@ function setupProfile() {
         autoSave,
 
        callOpenAI,
+
+       updateMemory,
 
         observer
 
