@@ -14,6 +14,7 @@
     window.__ZETA_MEMORY_RUNNING__ = true;
 
     const VERSION = "0.1.0";
+   const PROFILE_KEY = "zeta-memory-profile";
     const roomId = location.pathname.split("/").pop();
     const STORAGE_KEY = `zeta-memory-${roomId}`;
 
@@ -121,6 +122,33 @@
 
     function saveHistory() {
 
+function getProfile() {
+
+    const raw = localStorage.getItem(PROFILE_KEY);
+
+    if (!raw) return null;
+
+    try {
+
+        return JSON.parse(raw);
+
+    } catch {
+
+        return null;
+
+    }
+
+}
+
+function saveProfile(profile) {
+
+    localStorage.setItem(
+        PROFILE_KEY,
+        JSON.stringify(profile)
+    );
+
+}
+       
         const messages = getMessages();
 
         const data = {
@@ -169,6 +197,8 @@
 
             autoSave();
 
+           setupProfile();
+
         }, 300);
 
     });
@@ -189,6 +219,48 @@
     // Public API
     //------------------------------------------
 
+function setupProfile() {
+
+    if (getProfile()) return;
+
+    const profileName = prompt("프로필 이름", "기본");
+
+    if (profileName === null) return;
+
+    const provider = prompt(
+        "Provider\n(openai/openrouter)",
+        "openai"
+    );
+
+    if (provider === null) return;
+
+    const model = prompt(
+        "모델",
+        "gpt-5.5-nano"
+    );
+
+    if (model === null) return;
+
+    const apiKey = prompt("API Key");
+
+    if (apiKey === null) return;
+
+    saveProfile({
+
+        profileName,
+
+        provider,
+
+        model,
+
+        apiKey
+
+    });
+
+    console.log("✅ Profile Saved");
+
+}
+   
     window.ZetaMemory = {
 
         version: VERSION,
