@@ -169,14 +169,35 @@ function saveProfile(profile) {
 
 }
 
- async function callOpenAI(prompt) {
+async function callOpenAI(prompt) {
 
     const profile = getProfile();
 
-    ...
+    if (!profile) {
+        alert("프로필이 없습니다.");
+        return;
+    }
+
+    const url =
+        profile.provider === "cerebras"
+            ? "https://api.cerebras.ai/v1/chat/completions"
+            : "https://api.openai.com/v1/chat/completions";
 
     const res = await fetch(url, {
-        ...
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${profile.apiKey}`
+        },
+        body: JSON.stringify({
+            model: profile.model,
+            messages: [
+                {
+                    role: "user",
+                    content: prompt
+                }
+            ]
+        })
     });
 
     const data = await res.json();
@@ -184,50 +205,8 @@ function saveProfile(profile) {
     console.log(data);
 
     return data;
-
-}   // ← 여기서 callOpenAI 끝
-
-
-async function updateMemory() {
-
-    const history = getMessages();
-
-    const conversation = history.map(m => {
-
-        return `${m.role.toUpperCase()}\n${m.text}`;
-
-    }).join("\n\n");
-
-    const prompt = `
-
-현재까지의 대화를 장기 기억으로 요약하세요.
-
-규칙
-
-- 현재 상황만 남긴다.
-- 반복되는 대화는 제거한다.
-- 현재 장소를 유지한다.
-- 현재 관계를 유지한다.
-- 앞으로 RP를 이어가기 위해 필요한 정보만 남긴다.
-- 1500자 이내.
-
-대화
-
-${conversation}
-
-`;
-
-    return await callOpenAI(prompt);
-
 }
-
-    const data = await res.json();
-
-    console.log(data);
-
-    return data;
-
-}
+   
    
    //------------------------------------------
     // Auto Save
@@ -259,7 +238,9 @@ ${conversation}
 
             autoSave();
 
-           setupProfile();
+            setupProfile();
+
+      
 
         }, 300);
 
@@ -291,7 +272,7 @@ function setupProfile() {
 
     const provider = prompt(
         "Provider\n(cerebras)",
-        "openai"
+        "cerebras"
     );
 
     if (provider === null) return;
