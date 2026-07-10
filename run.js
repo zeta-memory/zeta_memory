@@ -54,7 +54,22 @@ function getMessages() {
 }
 
 window.ZetaMemory = {
-    getMessages
+    getMessages,
+    saveHistory
 };
 
 console.log(getMessages());
+
+function saveHistory() {
+    const data = {
+        roomId,
+        messages: getMessages()
+    };
+
+    localStorage.setItem(
+        `zeta-memory-${roomId}`,
+        JSON.stringify(data)
+    );
+
+    console.log("✅ History Saved");
+}
