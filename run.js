@@ -18,6 +18,8 @@
     const roomId = location.pathname.split("/").pop();
     const STORAGE_KEY = `zeta-memory-${roomId}`;
 
+   let updatingMemory = false;
+
     console.log(`🧠 Zeta Memory v${VERSION}`);
 
     //------------------------------------------
@@ -209,6 +211,10 @@ return data.choices[0].message.content;
 
    async function updateMemory() {
 
+      if (updatingMemory) return;
+
+updatingMemory = true;
+
     const history = getMessages();
 
     const conversation = history.map(m =>
@@ -248,6 +254,11 @@ localStorage.setItem(
 
 return memory;
 
+} finally {
+
+    updatingMemory = false;
+return memory;
+}
 }
    
    //------------------------------------------
