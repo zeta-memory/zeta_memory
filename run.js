@@ -61,6 +61,8 @@ window.ZetaMemory = {
 console.log(getMessages());
 
 function saveHistory() {
+    const roomId = location.pathname.split("/").pop();
+
     const data = {
         roomId,
         messages: getMessages()
