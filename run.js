@@ -266,6 +266,19 @@ return memory;
 
         saveHistory();
 
+       const history = getMessages();
+
+const length = history
+    .map(v => v.text)
+    .join("")
+    .length;
+
+if (length >= 5000) {
+
+    updateMemory();
+
+}
+
     }
 
     //------------------------------------------
