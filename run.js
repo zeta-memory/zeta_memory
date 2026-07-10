@@ -53,4 +53,8 @@ function getMessages() {
     return result;
 }
 
+window.ZetaMemory = {
+    getMessages
+};
+
 console.log(getMessages());
