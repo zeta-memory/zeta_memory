@@ -31,6 +31,8 @@
     const MEMORY_UPDATED_AT_KEY = `${STORAGE_KEY}-memory-updated-at`;
     const LOCKS_KEY = `${STORAGE_KEY}-locks`;
     const LOG_KEY = `${STORAGE_KEY}-log`;
+    const CONTEXT_KEY = `${STORAGE_KEY}-context`; // 로어북/기본설정 등 고정 컨텍스트
+    const MEMORY_HISTORY_KEY = `${STORAGE_KEY}-memory-history`; // 되돌리기용 이전 Memory 스냅샷
 
     const MEMORY_TAG = "[장기 기억]";
     const STREAM_URL_RE = /\/v1\/rooms\/[^/]+\/messages\/stream(?:\?|$)/;
@@ -266,6 +268,108 @@
     }
 
     //------------------------------------------
+    // 고정 컨텍스트 (로어북 / 기본설정) - 방 단위
+    //------------------------------------------
+    // 제타 페이지 DOM만으로는 로어북/기본설정 원문을 알 수 없어서,
+    // 사용자가 직접 붙여넣거나 아래 자동 시도 버튼으로 가져온 내용을
+    // 이 키에 저장해두고, 매 Memory 생성 시 프롬프트 맨 앞에 항상 포함시킨다.
+    // (대화 단편만 보고 요약해서 상황이 어긋나는 문제를 줄이기 위함)
+
+    function getRoomContext() {
+        return localStorage.getItem(CONTEXT_KEY) || "";
+    }
+
+    function saveRoomContext(text) {
+        localStorage.setItem(CONTEXT_KEY, text || "");
+    }
+
+    // 흔히 쓰이는 REST 패턴 몇 가지로 방/캐릭터 정보 원본 JSON을 시도해서 가져온다.
+    // 성공 여부와 무관하게 콘솔에도 응답을 남겨서, 실패 시 사용자가 Network 탭에서
+    // 실제 엔드포인트를 찾아 이 목록에 추가할 수 있게 한다.
+    async function tryAutoFetchRoomContext() {
+
+        const candidates = [
+            `/api/v1/rooms/${roomId}`,
+            `/api/v2/rooms/${roomId}`,
+            `/v1/rooms/${roomId}`,
+            `/api/rooms/${roomId}`,
+            `/api/v1/rooms/${roomId}/detail`,
+            `/api/v1/rooms/${roomId}/settings`
+        ];
+
+        for (const path of candidates) {
+            try {
+                const res = await fetch(path, { credentials: "include", headers: { Accept: "application/json" } });
+                if (!res.ok) continue;
+
+                const ct = res.headers.get("content-type") || "";
+                if (!ct.includes("application/json")) continue;
+
+                const data = await res.json();
+                console.log(`🧠 [Zeta Memory] ${path} 응답:`, data);
+
+                // 흔히 쓰일 법한 키 이름을 재귀적으로 탐색해서 후보만 추려 보여준다.
+                const found = {};
+                const KEY_HINTS = ["lore", "lorebook", "world", "setting", "persona", "description", "memo", "prompt"];
+
+                (function walk(obj, path2) {
+                    if (!obj || typeof obj !== "object") return;
+                    for (const k of Object.keys(obj)) {
+                        const v = obj[k];
+                        const lowerK = k.toLowerCase();
+                        if (KEY_HINTS.some(h => lowerK.includes(h)) && (typeof v === "string" || Array.isArray(v))) {
+                            found[`${path2}${k}`] = v;
+                        }
+                        if (v && typeof v === "object") walk(v, `${path2}${k}.`);
+                    }
+                })(data, "");
+
+                if (Object.keys(found).length > 0) {
+                    return { path, raw: data, found };
+                }
+                return { path, raw: data, found: null };
+
+            } catch { /* 다음 후보 시도 */ }
+        }
+
+        return null;
+    }
+
+    //------------------------------------------
+    // Memory 스냅샷 (되돌리기용)
+    //------------------------------------------
+
+    function getMemoryHistory() {
+        try {
+            const arr = JSON.parse(localStorage.getItem(MEMORY_HISTORY_KEY));
+            return Array.isArray(arr) ? arr : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function pushMemorySnapshot(prevMemory) {
+        if (!prevMemory) return;
+        const hist = getMemoryHistory();
+        hist.unshift({ time: Date.now(), memory: prevMemory });
+        localStorage.setItem(MEMORY_HISTORY_KEY, JSON.stringify(hist.slice(0, 5)));
+    }
+
+    function undoLastMemory() {
+        const hist = getMemoryHistory();
+        if (hist.length === 0) {
+            alert("되돌릴 이전 Memory가 없습니다.");
+            return false;
+        }
+        const [last, ...rest] = hist;
+        localStorage.setItem(MEMORY_KEY, last.memory);
+        localStorage.setItem(MEMORY_UPDATED_AT_KEY, Date.now());
+        localStorage.setItem(MEMORY_HISTORY_KEY, JSON.stringify(rest));
+        pushLog("Memory 되돌리기");
+        return true;
+    }
+
+    //------------------------------------------
     // UI - toggle button + main panel
     //------------------------------------------
 
@@ -277,7 +381,7 @@
 
     Object.assign(toggleBtn.style, {
         position: "fixed",
-        right: "16px",
+        left: "16px",
         bottom: "80px",
         width: "36px",
         height: "36px",
@@ -298,7 +402,7 @@
 
     Object.assign(panel.style, {
         position: "fixed",
-        right: "16px",
+        left: "16px",
         bottom: "124px",
         width: "240px",
         maxHeight: "70vh",
@@ -341,6 +445,7 @@
   <button id="zm-btn-view" style="${BTN_STYLE}">📖 보기</button>
   <button id="zm-btn-edit" style="${BTN_STYLE}">✏ 수정</button>
   <button id="zm-btn-reset" style="${BTN_STYLE}">🗑 초기화</button>
+  <button id="zm-btn-undo" style="${BTN_STYLE}">↩ 되돌리기</button>
   <button id="zm-btn-settings" style="${BTN_STYLE}">⚙ 설정</button>
   <button id="zm-btn-log" style="${BTN_STYLE}">📋 로그</button>
   <button id="zm-btn-export" style="${BTN_STYLE}">⬇ Export</button>
@@ -670,9 +775,10 @@
             const previousMemory = getMemory();
             const deltaConversation = buildConversation(deltaMessages);
             const settings = getSettings();
+            const roomContext = getRoomContext();
 
             const prompt = `${settings.prompt}
-
+${roomContext ? `\n[로어북 / 기본설정 (항상 참고, 대화 내용보다 우선하는 세계관 설정)]\n${roomContext}\n` : ""}
 [이전 Memory]
 ${previousMemory || "(없음, 최초 생성)"}
 
@@ -684,6 +790,8 @@ ${deltaConversation}
 
             const locks = getLocks();
             memory = applyLocks(memory, previousMemory, locks);
+
+            pushMemorySnapshot(previousMemory);
 
             localStorage.setItem(MEMORY_KEY, memory);
             localStorage.setItem(MEMORY_INDEX_KEY, history.length);
@@ -870,6 +978,8 @@ ${deltaConversation}
             memoryIndex: localStorage.getItem(MEMORY_INDEX_KEY),
             memoryLength: localStorage.getItem(MEMORY_LENGTH_KEY),
             memoryUpdatedAt: localStorage.getItem(MEMORY_UPDATED_AT_KEY),
+            memoryHistory: localStorage.getItem(MEMORY_HISTORY_KEY),
+            context: localStorage.getItem(CONTEXT_KEY),
             locks: localStorage.getItem(LOCKS_KEY),
             log: localStorage.getItem(LOG_KEY),
             settings: localStorage.getItem(SETTINGS_KEY)
@@ -901,6 +1011,8 @@ ${deltaConversation}
                 if (data.memoryIndex) localStorage.setItem(MEMORY_INDEX_KEY, data.memoryIndex);
                 if (data.memoryLength) localStorage.setItem(MEMORY_LENGTH_KEY, data.memoryLength);
                 if (data.memoryUpdatedAt) localStorage.setItem(MEMORY_UPDATED_AT_KEY, data.memoryUpdatedAt);
+                if (data.memoryHistory) localStorage.setItem(MEMORY_HISTORY_KEY, data.memoryHistory);
+                if (data.context) localStorage.setItem(CONTEXT_KEY, data.context);
                 if (data.locks) localStorage.setItem(LOCKS_KEY, data.locks);
                 if (data.log) localStorage.setItem(LOG_KEY, data.log);
                 if (data.settings) localStorage.setItem(SETTINGS_KEY, data.settings);
@@ -1099,6 +1211,18 @@ ${deltaConversation}
 
 <hr style="margin:12px 0;border-color:#333;">
 
+<div style="font-weight:bold;margin-bottom:6px;">🌍 고정 컨텍스트 (로어북 / 기본설정)</div>
+<div style="color:#999;font-size:11px;margin-bottom:6px;">
+  여기에 적어둔 내용은 Memory 생성 시 항상 함께 전달됩니다. 대화 단편만 보고
+  요약해서 상황이 어긋나는 문제를 줄여줍니다. 아래 버튼은 몇 가지 흔한 API
+  패턴으로 방 정보를 자동으로 가져와보는 시도이며, 제타 쪽 구조상 실패할 수
+  있습니다 (그 경우 콘솔 로그를 참고해 직접 붙여넣어 주세요).
+</div>
+<textarea id="zm-context" style="width:100%;height:18vh;background:#111;color:#fff;border:1px solid #444;border-radius:6px;padding:8px;font-size:12px;box-sizing:border-box;">${escapeHtml(getRoomContext())}</textarea>
+<button id="zm-context-fetch" style="${BTN_STYLE};margin-top:6px;width:100%;">🔍 방 정보 자동 가져오기 시도</button>
+
+<hr style="margin:12px 0;border-color:#333;">
+
 <div style="font-weight:bold;margin-bottom:6px;">Memory 생성 Prompt</div>
 <textarea id="zm-prompt" style="width:100%;height:30vh;background:#111;color:#fff;border:1px solid #444;border-radius:6px;padding:8px;font-size:12px;box-sizing:border-box;">${escapeHtml(settings.prompt)}</textarea>
 <button id="zm-prompt-reset" style="${BTN_STYLE};margin-top:6px;width:100%;">Prompt 초기화</button>
@@ -1149,6 +1273,35 @@ ${deltaConversation}
             body.querySelector("#zm-prompt").value = DEFAULT_PROMPT;
         });
 
+        body.querySelector("#zm-context-fetch").addEventListener("click", async () => {
+            const btn = body.querySelector("#zm-context-fetch");
+            btn.textContent = "가져오는 중...";
+            btn.disabled = true;
+            try {
+                const result = await tryAutoFetchRoomContext();
+                if (!result) {
+                    alert("자동으로 가져오는 데 실패했습니다. 브라우저 개발자도구 Network 탭에서 방 정보를 불러오는 요청(GET) URL을 확인해서, 스크립트의 tryAutoFetchRoomContext() 후보 목록에 추가해 주세요.");
+                    return;
+                }
+                if (result.found) {
+                    const text = Object.entries(result.found)
+                        .map(([k, v]) => `# ${k}\n${Array.isArray(v) ? v.join("\n") : v}`)
+                        .join("\n\n");
+                    body.querySelector("#zm-context").value = text;
+                    alert(`"${result.path}" 에서 로어북/설정으로 추정되는 항목을 찾았습니다. 내용을 확인 후 필요 없는 부분은 지워주세요.`);
+                } else {
+                    console.log("🧠 [Zeta Memory] 응답은 받았지만 로어북/설정으로 보이는 필드를 자동으로 못 찾았습니다:", result.raw);
+                    alert(`"${result.path}" 응답은 받았지만 자동으로 필드를 특정하지 못했습니다. 콘솔(F12)에 원본 JSON을 출력해뒀으니 확인 후 직접 붙여넣어 주세요.`);
+                }
+            } catch (err) {
+                console.error(err);
+                alert("가져오는 중 오류가 발생했습니다. 콘솔을 확인해주세요.");
+            } finally {
+                btn.textContent = "🔍 방 정보 자동 가져오기 시도";
+                btn.disabled = false;
+            }
+        });
+
         var overlay = openModal("⚙ 설정", body, {
             saveLabel: "설정 저장",
             onSave: () => {
@@ -1168,6 +1321,8 @@ ${deltaConversation}
                     relationship: body.querySelector("#zm-lock-relationship").checked,
                     setting: body.querySelector("#zm-lock-setting").checked
                 });
+
+                saveRoomContext(body.querySelector("#zm-context").value);
 
                 pushLog("설정 저장");
                 refreshPanel();
@@ -1200,6 +1355,16 @@ ${deltaConversation}
 
     document.getElementById("zm-btn-settings").addEventListener("click", showSettingsModal);
     document.getElementById("zm-btn-log").addEventListener("click", showLogModal);
+
+    document.getElementById("zm-btn-undo").addEventListener("click", () => {
+        const hist = getMemoryHistory();
+        if (hist.length === 0) {
+            alert("되돌릴 이전 Memory가 없습니다.");
+            return;
+        }
+        if (!confirm(`현재 Memory를 ${new Date(hist[0].time).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} 시점으로 되돌릴까요?`)) return;
+        if (undoLastMemory()) refreshPanel();
+    });
 
     // 짧게 탭: 방 단위 백업 / 0.6초 이상 길게 누르기(모바일) or 우클릭(PC): 전체 백업
     (function wireExportButton() {
@@ -1314,6 +1479,11 @@ ${deltaConversation}
         exportRoom,
         exportAll,
         getLog,
+        getRoomContext,
+        saveRoomContext,
+        tryAutoFetchRoomContext,
+        getMemoryHistory,
+        undoLastMemory,
         observer
     };
 
