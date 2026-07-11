@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note (Persona Sync)
 // @namespace    zeta-usernote
-// @version      3.3.0-purenote
+// @version      3.4.0-basenote
 // @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -14,19 +14,21 @@
     "use strict";
 
     // ==========================
-    // Zeta User Note v3.0.0 (Persona Sync)
+    // Zeta User Note v3.4.0 (Persona Sync — base + note)
     //
     // 원리:
-    // - 채팅 메시지를 건드리지 않는다. (이전 버전은 메시지에 노트를 끼워넣는
-    //   방식이라 서버/대화기록에 노트가 그대로 남는 근본적 한계가 있었음)
-    // - 대신 제타가 이미 공식적으로 지원하는 "유저 페르소나" 기능의
-    //   description 필드를 API(PATCH)로 직접 갱신한다.
-    // - 페르소나는 채팅 메시지가 아니라 별도 설정이라 대화기록에 안 남고,
-    //   AI에게는 항상(매 턴) 배경 정보로 로드된다.
+    // - 채팅 메시지를 건드리지 않는다.
+    // - 제타의 "유저 페르소나"(user-chat-profiles) description 필드를
+    //   API(PATCH)로 직접 갱신한다. 채팅 메시지가 아니라 별도 설정이라
+    //   대화기록엔 안 남고, AI에게는 항상(매 턴) 배경 정보로 로드된다.
+    // - "기존 프로필(base)"과 "노트"를 완전히 분리해서 관리한다.
+    //   base는 처음 한 번만 서버에서 가져와 고정해두고, 명시적으로
+    //   '프로필 새로고침'을 누르기 전까지 절대 자동으로 안 바뀐다.
+    //   동기화할 때마다 base + 노트를 재조합해서 보내므로 몇 번을 눌러도
+    //   중복되거나 base가 사라지지 않는다.
+    // - 안내문구나 태그 없이, base와 노트 사이에 빈 줄 하나만 넣는다.
     // - 인증 토큰(Authorization 헤더)은 site가 만드는 실제 요청에서
     //   실시간으로 훔쳐봐서(sniff) 재사용한다. 하드코딩 불가 (단기 토큰이라).
-    // - 유저가 페르소나 화면에서 직접 써둔 원본 문구는 보존하고, 우리
-    //   노트는 마커로 감싸서 그 부분만 갱신한다.
     // ==========================
 
     if (window.__ZETA_USERNOTE_RUNNING__) {
@@ -35,10 +37,7 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.3.0-purenote";
-
-    // v3.3.0부터: 텍스트박스 내용 = 페르소나 description, 완전히 그대로 1:1.
-    // 마커나 안내문구를 덧붙이지 않는다 (유저가 직접 요청한 사양).
+    const VERSION = "3.4.0-basenote";
 
     const PROFILES_LIST_RE = /\/v1\/user-chat-profiles(?:\?|$)/;
     const PLOT_ROOM_RE = /\/plots\/([^/]+)\/rooms\/([^/]+)\//;
@@ -112,6 +111,23 @@
         localStorage.setItem(personaKey(id), JSON.stringify(persona));
     }
 
+    // "기존 프로필(base)"은 노트랑 완전히 별개로 저장한다.
+    // 처음 한 번만 서버 값을 그대로 base로 굳혀두고, 그 뒤로는
+    // '프로필 새로고침'을 명시적으로 누르기 전까지 절대 자동으로 안 건드림.
+    // (동기화할 때마다 base + 노트를 재조합해서 보내므로, 매번 눌러도 중복 안 됨)
+    function baseDescKey(id) {
+        return `zeta-usernote-basedesc-${id}`;
+    }
+
+    function getCachedBaseDesc(id) {
+        const v = localStorage.getItem(baseDescKey(id));
+        return v === null ? null : v; // null = "아직 한 번도 base를 못 잡음"
+    }
+
+    function setCachedBaseDesc(id, text) {
+        localStorage.setItem(baseDescKey(id), text || "");
+    }
+
     //------------------------------------------
     // 실시간 훔쳐보기 상태: 인증 토큰 / plotId / 현재 페르소나
     //------------------------------------------
@@ -157,6 +173,14 @@
             if (sel && sel.id) {
                 const persona = { id: sel.id, name: sel.name, description: sel.description || "" };
                 setCachedPersona(atRoomId, persona);
+
+                // base가 아직 한 번도 안 잡혔던 방이면, 지금 서버 값을 base로 굳힌다.
+                // (이미 base가 있으면 절대 자동으로 안 건드림 — 우리가 이미 동기화해서
+                //  서버에 base+노트가 합쳐져 있을 수도 있으므로)
+                if (getCachedBaseDesc(atRoomId) === null) {
+                    setCachedBaseDesc(atRoomId, persona.description);
+                }
+
                 if (atRoomId === roomId) {
                     capturedPersona = persona;
                     updatePersonaStatus();
@@ -274,8 +298,9 @@
 
   <div class="persona-status" id="persona-status">감지 중...</div>
 
-  <textarea id="note" placeholder="이 칸에 쓴 내용이 그대로(1:1) 페르소나 description으로 저장됩니다.
-기존 프로필 내용을 유지하고 싶으면 지우지 말고 이 안에 같이 넣어서 쓰세요."></textarea>
+  <textarea id="note" placeholder="여기 쓴 내용만 '노트'로 저장됩니다.
+기존 페르소나 프로필 내용(이름/나이/설정 등)은 그대로 따로 유지되고,
+동기화하면 그 뒤에 이 노트가 이어 붙습니다."></textarea>
   <div class="count" id="count">0자</div>
 
   <div class="row">
@@ -283,7 +308,7 @@
     <span class="saved-badge" id="saved">저장됨</span>
   </div>
   <div class="row">
-    <button id="refresh-persona">프로필 새로고침</button>
+    <button id="refresh-persona">기존 프로필 새로고침 (base 재설정)</button>
   </div>
   <div class="row">
     <button id="clear">노트 비우기</button>
@@ -348,19 +373,16 @@
 
     function updatePersonaStatus() {
         if (capturedPersona && capturedPersona.id) {
+            const base = getCachedBaseDesc(roomId);
+            const baseLen = base === null ? null : base.length;
+            const noteLen = noteEl.value.length;
+
             personaStatusEl.className = "persona-status ok";
             personaStatusEl.textContent =
                 `✅ 연결됨: ${capturedPersona.name || "(이름없음)"} (${capturedPersona.id.slice(0, 8)}...)\n` +
-                `서버 저장된 글자수: ${(capturedPersona.description || "").length}자`;
-
-            // 로컬 노트가 비어있으면(처음 시작하는 경우) 서버에 이미 저장된
-            // 내용을 그대로 채워준다 — 안 그러면 기존 프로필 내용이
-            // 다음 동기화 때 통째로 지워질 수 있음.
-            if (!getNote().trim() && capturedPersona.description) {
-                noteEl.value = capturedPersona.description;
-                saveNote(capturedPersona.description);
-                updateCount();
-            }
+                (baseLen === null
+                    ? "⚠ 기존 프로필(base) 아직 못 잡음 → '프로필 새로고침' 눌러주세요"
+                    : `기존 프로필(고정) ${baseLen}자 + 노트 ${noteLen}자 = 합계 ${baseLen + noteLen + (noteLen ? 2 : 0)}자`);
         } else {
             personaStatusEl.className = "persona-status bad";
             personaStatusEl.textContent =
@@ -482,7 +504,15 @@
             return;
         }
 
-        const newDesc = note;
+        let base = getCachedBaseDesc(roomId);
+        if (base === null) {
+            flashSaved("기존 프로필 정보 없음 ❌");
+            showDebugToast("⚠ 기존 프로필(base)을 아직 못 잡았어요.\n'프로필 새로고침' 버튼을 먼저 눌러서 기존 내용을 확보해주세요. (이게 없으면 기존 프로필이 노트로 덮어써질 위험이 있어서 일부러 막아둔 거예요)");
+            return;
+        }
+
+        const trimmedNote = note.trim();
+        const newDesc = trimmedNote ? (base.replace(/\s+$/, "") + "\n\n" + trimmedNote) : base;
 
         try {
             const res = await originalFetch(PROFILE_PATCH_URL(capturedPersona.id), {
@@ -495,15 +525,16 @@
             });
 
             if (res.ok) {
-                capturedPersona.description = newDesc;
+                // base는 절대 안 건드린다 — 다음에도 base + 노트로 재조합해서 보냄.
+                capturedPersona.description = newDesc; // 화면 표시/참고용
                 setCachedPersona(roomId, capturedPersona);
                 flashSaved("동기화 완료 ✅");
-                showDebugToast("✅ 프로필에 동기화됨 (마지막 200자)\n" + newDesc.slice(-200));
+                showDebugToast(`✅ 프로필에 동기화됨 (총 ${newDesc.length}자, 마지막 200자)\n` + newDesc.slice(-200));
                 updatePersonaStatus();
             } else {
                 const t = await res.text().catch(() => "");
                 flashSaved("동기화 실패 ❌");
-                showDebugToast(`❌ 실패 (HTTP ${res.status})\n` + t.slice(0, 200));
+                showDebugToast(`❌ 실패 (HTTP ${res.status}, 시도한 총 글자수: ${newDesc.length}자)\n` + t.slice(0, 200));
             }
         } catch (err) {
             flashSaved("동기화 실패 ❌");
@@ -537,8 +568,13 @@
                 if (sel && sel.id) {
                     capturedPersona = { id: sel.id, name: sel.name, description: sel.description || "" };
                     setCachedPersona(roomId, capturedPersona);
+                    setCachedBaseDesc(roomId, sel.description || "");
                     updatePersonaStatus();
                     flashSaved("프로필 새로고침됨 ✅");
+                    showDebugToast(
+                        "✅ 서버의 현재 description을 새 base로 저장했어요.\n" +
+                        "⚠ 참고: Zeta 화면에서 직접 프로필을 수정한 게 아니라면, 이 값엔 이전에 동기화했던 노트가 이미 섞여 있을 수 있어요."
+                    );
                     return;
                 }
 
@@ -562,6 +598,7 @@
     let saveDebounce = null;
     noteEl.addEventListener("input", () => {
         updateCount();
+        updatePersonaStatus();
         clearTimeout(saveDebounce);
         saveDebounce = setTimeout(() => saveNote(noteEl.value), 600);
     });
@@ -570,7 +607,7 @@
     el("refresh-persona").addEventListener("click", manualRefreshPersona);
 
     el("clear").addEventListener("click", () => {
-        if (!confirm("노트를 비울까요?\n\n⚠ 주의: 이 상태로 '저장 & 동기화'를 누르면 페르소나 description이 완전히 빈 값으로 덮어써집니다 (기존 프로필 내용도 같이 사라짐).")) return;
+        if (!confirm("노트를 비울까요? (기존 페르소나 프로필 내용은 영향 없어요. '저장 & 동기화'를 눌러야 서버에도 노트가 빠집니다)")) return;
         noteEl.value = "";
         saveNote("");
         updateCount();
