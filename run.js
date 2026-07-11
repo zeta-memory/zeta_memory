@@ -292,6 +292,9 @@
     <button id="force">지금 바로 삽입</button>
   </div>
   <div class="row">
+    <button id="reset-progress">진행도 초기화</button>
+  </div>
+  <div class="row">
     <button id="clear">노트 비우기</button>
   </div>
 
@@ -468,10 +471,10 @@
     });
 
     //------------------------------------------
-    // 노트 저장 / 비우기 / 강제 삽입
+    // 노트 저장 / 비우기 / 강제 삽입 / 진행도 초기화
     //
-    // 노트를 저장하면 "지금 이 순간"을 새 기준점으로 삼는다.
-    // (새로 적은 사건은 지금부터 다시 threshold자 진행 후 삽입됨)
+    // 저장(save)은 노트 "내용만" 저장한다 — 진행도(체크포인트)는 건드리지 않는다.
+    // 진행도를 리셋하고 싶으면 "진행도 초기화" 버튼을 따로 눌러야 한다.
     //------------------------------------------
 
     let saveDebounce = null;
@@ -484,12 +487,17 @@
 
     function doSave() {
         saveNote(noteEl.value);
-        setCheckpoint(getMessages());
         refreshProgress();
-        flashSaved("저장됨 (진행도 초기화)");
+        flashSaved("저장됨");
     }
 
     el("save").addEventListener("click", doSave);
+
+    el("reset-progress").addEventListener("click", () => {
+        setCheckpoint(getMessages());
+        refreshProgress();
+        flashSaved("진행도 초기화됨");
+    });
 
     el("clear").addEventListener("click", () => {
         if (!confirm("이 방의 노트를 비울까요?")) return;
