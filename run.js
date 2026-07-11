@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Zeta User Note (Persona Sync)
 // @namespace    zeta-usernote
-// @version      3.4.0-basenote
-// @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음.
+// @version      3.5.0-autosync
+// @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음. 자동동기화 + plotId 캐시 개선.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
 // @run-at       document-start
@@ -14,21 +14,28 @@
     "use strict";
 
     // ==========================
-    // Zeta User Note v3.4.0 (Persona Sync — base + note)
+    // Zeta User Note v3.5.0 (Persona Sync — base + note + autosync)
     //
-    // 원리:
+    // v3.4.0 대비 변경점:
+    // 1) sniffOutgoingUrl: 이전엔 "URL에서 찾은 방ID === 현재 활성 roomId"일 때만
+    //    plotId를 캐시했음 → SPA 라우팅 타이밍이 어긋나면 영영 못 잡고
+    //    결국 plotId 없이 프로필을 조회해서 "기본 프로필"이 붙는 문제 발생.
+    //    지금은 URL에서 찾은 방ID 기준으로 무조건 캐시해두고,
+    //    현재 방과 같을 때만 활성 변수에도 반영. (+ 콘솔 디버그 로그)
+    // 2) manualRefreshPersona: lastPlotId가 비어있으면 localStorage 캐시로 폴백.
+    // 3) maybeAutoSync(): 노트 입력 / 페르소나 감지(=패널 열림, 방 진입) 시
+    //    서버 값과 다르면 자동으로 동기화. 수동 "저장 & 동기화" 버튼은 그대로 유지(원하면 눌러도 됨).
+    // 4) testMaxLength(): 서버가 실제로 허용하는 글자수 상한을 이진탐색으로 찾는 콘솔 유틸.
+    //    (UI의 500자 제한과 별개로 API 자체에 상한이 있어서 긴 노트가 400으로 실패할 수 있음)
+    //
+    // 원리(기존과 동일):
     // - 채팅 메시지를 건드리지 않는다.
     // - 제타의 "유저 페르소나"(user-chat-profiles) description 필드를
     //   API(PATCH)로 직접 갱신한다. 채팅 메시지가 아니라 별도 설정이라
     //   대화기록엔 안 남고, AI에게는 항상(매 턴) 배경 정보로 로드된다.
     // - "기존 프로필(base)"과 "노트"를 완전히 분리해서 관리한다.
-    //   base는 처음 한 번만 서버에서 가져와 고정해두고, 명시적으로
-    //   '프로필 새로고침'을 누르기 전까지 절대 자동으로 안 바뀐다.
-    //   동기화할 때마다 base + 노트를 재조합해서 보내므로 몇 번을 눌러도
-    //   중복되거나 base가 사라지지 않는다.
-    // - 안내문구나 태그 없이, base와 노트 사이에 빈 줄 하나만 넣는다.
     // - 인증 토큰(Authorization 헤더)은 site가 만드는 실제 요청에서
-    //   실시간으로 훔쳐봐서(sniff) 재사용한다. 하드코딩 불가 (단기 토큰이라).
+    //   실시간으로 훔쳐봐서(sniff) 재사용한다.
     // ==========================
 
     if (window.__ZETA_USERNOTE_RUNNING__) {
@@ -37,7 +44,8 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.4.0-basenote";
+    const VERSION = "3.5.0-autosync";
+    const DEBUG = true; // 콘솔(F12)에 plotId/roomId 감지 로그를 남길지 여부
 
     const PROFILES_LIST_RE = /\/v1\/user-chat-profiles(?:\?|$)/;
     const PLOT_ROOM_RE = /\/plots\/([^/]+)\/rooms\/([^/]+)\//;
@@ -112,9 +120,6 @@
     }
 
     // "기존 프로필(base)"은 노트랑 완전히 별개로 저장한다.
-    // 처음 한 번만 서버 값을 그대로 base로 굳혀두고, 그 뒤로는
-    // '프로필 새로고침'을 명시적으로 누르기 전까지 절대 자동으로 안 건드림.
-    // (동기화할 때마다 base + 노트를 재조합해서 보내므로, 매번 눌러도 중복 안 됨)
     function baseDescKey(id) {
         return `zeta-usernote-basedesc-${id}`;
     }
@@ -139,9 +144,19 @@
     function sniffOutgoingUrl(url) {
         if (!url) return;
         const m = PLOT_ROOM_RE.exec(url);
-        if (m && m[2] === roomId) {
-            lastPlotId = m[1];
-            setCachedPlotId(roomId, m[1]);
+        if (m) {
+            const plotId = m[1];
+            const rId = m[2];
+            // ★ v3.5: 현재 활성 roomId와 일치하는지 여부와 무관하게,
+            //   URL에서 찾은 실제 방ID 기준으로 항상 캐시해둔다.
+            //   (타이밍 어긋나서 못 잡는 문제 방지)
+            setCachedPlotId(rId, plotId);
+            if (rId === roomId) {
+                lastPlotId = plotId;
+            }
+            if (DEBUG) {
+                console.log("📝 UserNote[debug] plot/room 감지:", { url, plotId, rId, activeRoomId: roomId });
+            }
         }
     }
 
@@ -174,9 +189,6 @@
                 const persona = { id: sel.id, name: sel.name, description: sel.description || "" };
                 setCachedPersona(atRoomId, persona);
 
-                // base가 아직 한 번도 안 잡혔던 방이면, 지금 서버 값을 base로 굳힌다.
-                // (이미 base가 있으면 절대 자동으로 안 건드림 — 우리가 이미 동기화해서
-                //  서버에 base+노트가 합쳐져 있을 수도 있으므로)
                 if (getCachedBaseDesc(atRoomId) === null) {
                     setCachedBaseDesc(atRoomId, persona.description);
                 }
@@ -184,6 +196,7 @@
                 if (atRoomId === roomId) {
                     capturedPersona = persona;
                     updatePersonaStatus();
+                    maybeAutoSync(); // ★ v3.5: 페르소나 감지될 때 자동으로 노트 반영 시도
                 }
                 console.log("📝 UserNote: 페르소나 감지됨 (목록):", atRoomId, persona.id, persona.name);
             }
@@ -269,6 +282,10 @@
   .persona-status.ok { border-color: #2f6b3f; color: #7CFC9C; }
   .persona-status.bad { border-color: #6b4a2f; color: #ffb347; }
 
+  .auto-note {
+    font-size: 9px; color: #888; margin-top: 4px;
+  }
+
   #debug-toast {
     position: fixed;
     left: 8px; right: 8px; bottom: 8px;
@@ -300,11 +317,12 @@
 
   <textarea id="note" placeholder="여기 쓴 내용만 '노트'로 저장됩니다.
 기존 페르소나 프로필 내용(이름/나이/설정 등)은 그대로 따로 유지되고,
-동기화하면 그 뒤에 이 노트가 이어 붙습니다."></textarea>
+입력하면 자동으로 동기화됩니다 (버튼 안 눌러도 됨)."></textarea>
   <div class="count" id="count">0자</div>
+  <div class="auto-note">✎ 입력 후 잠시 뒤 자동 동기화됩니다. 버튼은 즉시 반영하고 싶을 때만 누르세요.</div>
 
   <div class="row">
-    <button class="primary" id="sync">저장 &amp; 동기화</button>
+    <button class="primary" id="sync">지금 바로 동기화</button>
     <span class="saved-badge" id="saved">저장됨</span>
   </div>
   <div class="row">
@@ -397,6 +415,7 @@
         noteEl.value = getNote();
         updateCount();
         updatePersonaStatus();
+        maybeAutoSync(); // ★ v3.5: 패널 열거나 방 전환 시에도 자동 반영 체크
     }
 
     refreshRoomUI();
@@ -507,7 +526,7 @@
         let base = getCachedBaseDesc(roomId);
         if (base === null) {
             flashSaved("기존 프로필 정보 없음 ❌");
-            showDebugToast("⚠ 기존 프로필(base)을 아직 못 잡았어요.\n'프로필 새로고침' 버튼을 먼저 눌러서 기존 내용을 확보해주세요. (이게 없으면 기존 프로필이 노트로 덮어써질 위험이 있어서 일부러 막아둔 거예요)");
+            showDebugToast("⚠ 기존 프로필(base)을 아직 못 잡았어요.\n'프로필 새로고침' 버튼을 먼저 눌러서 기존 내용을 확보해주세요.");
             return;
         }
 
@@ -525,8 +544,7 @@
             });
 
             if (res.ok) {
-                // base는 절대 안 건드린다 — 다음에도 base + 노트로 재조합해서 보냄.
-                capturedPersona.description = newDesc; // 화면 표시/참고용
+                capturedPersona.description = newDesc;
                 setCachedPersona(roomId, capturedPersona);
                 flashSaved("동기화 완료 ✅");
                 showDebugToast(`✅ 프로필에 동기화됨 (총 ${newDesc.length}자, 마지막 200자)\n` + newDesc.slice(-200));
@@ -534,12 +552,27 @@
             } else {
                 const t = await res.text().catch(() => "");
                 flashSaved("동기화 실패 ❌");
-                showDebugToast(`❌ 실패 (HTTP ${res.status}, 시도한 총 글자수: ${newDesc.length}자)\n` + t.slice(0, 200));
+                showDebugToast(`❌ 실패 (HTTP ${res.status}, 시도한 총 글자수: ${newDesc.length}자)\n서버 글자수 제한일 수 있어요. 콘솔에서 ZetaUserNote.testMaxLength() 실행해보세요.\n` + t.slice(0, 200));
             }
         } catch (err) {
             flashSaved("동기화 실패 ❌");
             showDebugToast("❌ 네트워크 오류: " + (err && err.message));
         }
+    }
+
+    // ★ v3.5: 자동 동기화. 서버에 저장된 description이 이미 base+note와 같으면 아무 것도 안 함(불필요한 PATCH 방지).
+    let autoSyncTimer = null;
+    function maybeAutoSync() {
+        clearTimeout(autoSyncTimer);
+        autoSyncTimer = setTimeout(() => {
+            const note = getNote().trim();
+            if (!capturedAuth || !capturedPersona || !capturedPersona.id) return;
+            const base = getCachedBaseDesc(roomId);
+            if (base === null) return; // base 아직 없음 → refresh-persona 필요, 억지로 시도 안 함
+            const expected = note ? (base.replace(/\s+$/, "") + "\n\n" + note) : base;
+            if ((capturedPersona.description || "") === expected) return; // 이미 동기화된 상태
+            syncNow();
+        }, 500);
     }
 
     async function manualRefreshPersona() {
@@ -548,12 +581,15 @@
             flashSaved("실패 ❌");
             return;
         }
-        if (!lastPlotId) {
-            showDebugToast("⚠ plotId를 아직 못 찾았어요 (null). 채팅방에서 스크롤하거나 메시지를 하나 보내본 뒤 다시 시도해주세요.");
+        // ★ v3.5: lastPlotId가 비어있으면 localStorage 캐시로 폴백
+        const plotId = lastPlotId || getCachedPlotId(roomId);
+        if (!plotId) {
+            showDebugToast("⚠ plotId를 아직 못 찾았어요. 콘솔(F12)에 'UserNote[debug] plot/room 감지' 로그가 뜨는지 확인해주세요.\n방 안에서 스크롤하거나 메시지를 하나 보내본 뒤 다시 시도해주세요.");
             flashSaved("실패 ❌ (plotId 없음)");
             return;
         }
-        const url = `https://api.zeta-ai.io/v1/user-chat-profiles?plotId=${lastPlotId}`;
+        lastPlotId = plotId;
+        const url = `https://api.zeta-ai.io/v1/user-chat-profiles?plotId=${plotId}`;
         try {
             const res = await originalFetch(url, { headers: { "Authorization": capturedAuth } });
             const bodyText = await res.text();
@@ -573,8 +609,10 @@
                     flashSaved("프로필 새로고침됨 ✅");
                     showDebugToast(
                         "✅ 서버의 현재 description을 새 base로 저장했어요.\n" +
-                        "⚠ 참고: Zeta 화면에서 직접 프로필을 수정한 게 아니라면, 이 값엔 이전에 동기화했던 노트가 이미 섞여 있을 수 있어요."
+                        "⚠ 참고: Zeta 화면에서 직접 프로필을 수정한 게 아니라면, 이 값엔 이전에 동기화했던 노트가 이미 섞여 있을 수 있어요.\n" +
+                        `사용된 plotId: ${plotId}`
                     );
+                    maybeAutoSync();
                     return;
                 }
 
@@ -595,23 +633,61 @@
         }
     }
 
+    // ★ 서버가 실제로 허용하는 최대 글자수를 이진탐색으로 찾는 콘솔 유틸.
+    //   콘솔에서: await ZetaUserNote.testMaxLength()
+    //   주의: 테스트 중 프로필 description이 임시로 더미문자(x)로 여러 번 덮어써집니다.
+    //         테스트가 끝나면 반드시 패널에서 '지금 바로 동기화'를 눌러 실제 노트로 되돌리세요.
+    async function testMaxLength() {
+        if (!capturedAuth || !capturedPersona || !capturedPersona.id) {
+            console.log("❌ auth/persona 없음. 패널을 한번 열고 다시 시도해주세요.");
+            return null;
+        }
+        const base = getCachedBaseDesc(roomId) || "";
+        let lo = 0, hi = 4000, lastOk = 0;
+        console.log("🔍 서버 실제 글자수 제한 탐색 시작... (프로필이 임시로 여러 번 덮어써집니다)");
+        while (lo <= hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            const testDesc = base.replace(/\s+$/, "") + "\n\n" + "x".repeat(mid);
+            try {
+                const res = await originalFetch(PROFILE_PATCH_URL(capturedPersona.id), {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json", "Authorization": capturedAuth },
+                    body: JSON.stringify({ name: capturedPersona.name, description: testDesc })
+                });
+                if (res.ok) { lastOk = mid; lo = mid + 1; }
+                else { hi = mid - 1; }
+            } catch (err) {
+                console.log("❌ 테스트 중 네트워크 오류:", err && err.message);
+                break;
+            }
+        }
+        const totalMax = lastOk + base.length + 2;
+        console.log(`✅ 대략적인 노트 최대 글자수: ${lastOk}자 (base ${base.length}자 포함 총 약 ${totalMax}자)`);
+        console.log("⚠ 지금 프로필엔 테스트용 'x' 문자열이 남아있어요. 패널 열고 '지금 바로 동기화'를 눌러 실제 노트로 덮어써주세요.");
+        return { noteMax: lastOk, base: base.length, total: totalMax };
+    }
+
     let saveDebounce = null;
     noteEl.addEventListener("input", () => {
         updateCount();
         updatePersonaStatus();
         clearTimeout(saveDebounce);
-        saveDebounce = setTimeout(() => saveNote(noteEl.value), 600);
+        saveDebounce = setTimeout(() => {
+            saveNote(noteEl.value);
+            maybeAutoSync(); // ★ v3.5: 입력만 해도 자동 반영, 버튼 안 눌러도 됨
+        }, 800);
     });
 
     el("sync").addEventListener("click", syncNow);
     el("refresh-persona").addEventListener("click", manualRefreshPersona);
 
     el("clear").addEventListener("click", () => {
-        if (!confirm("노트를 비울까요? (기존 페르소나 프로필 내용은 영향 없어요. '저장 & 동기화'를 눌러야 서버에도 노트가 빠집니다)")) return;
+        if (!confirm("노트를 비울까요? (기존 페르소나 프로필 내용은 영향 없어요)")) return;
         noteEl.value = "";
         saveNote("");
         updateCount();
-        flashSaved("비움 (동기화 필요)");
+        flashSaved("비움 (자동 반영됨)");
+        maybeAutoSync();
     });
 
     el("reset-pos").addEventListener("click", () => {
@@ -765,14 +841,15 @@
                     alert("이 파일은 Room 백업 파일이 아닙니다.");
                     return;
                 }
-                if (!confirm(`현재 방(${roomId})의 노트를 백업 파일 내용으로 덮어씁니다. 계속할까요? ('저장 & 동기화'를 눌러야 실제 반영됩니다)`)) return;
+                if (!confirm(`현재 방(${roomId})의 노트를 백업 파일 내용으로 덮어씁니다. 계속할까요? (자동으로 동기화됩니다)`)) return;
 
                 if (data.note != null) {
                     noteEl.value = data.note;
                     saveNote(data.note);
                     updateCount();
+                    maybeAutoSync();
                 }
-                flashSaved("Import 완료 (동기화 필요)");
+                flashSaved("Import 완료");
             } catch (err) {
                 console.error(err);
                 alert("파일을 읽는 중 오류가 발생했습니다.");
@@ -795,11 +872,12 @@
         saveNote,
         syncNow,
         manualRefreshPersona,
+        testMaxLength,
         get roomId() { return roomId; },
         get capturedPersona() { return capturedPersona; },
         get hasAuth() { return !!capturedAuth; }
     };
 
-    console.log(`📝 Zeta UserNote v${VERSION} (Persona Sync) Ready`);
+    console.log(`📝 Zeta UserNote v${VERSION} (Persona Sync, Auto-Sync) Ready`);
 
 })();
