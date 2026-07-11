@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note (Persona Sync)
 // @namespace    zeta-usernote
-// @version      3.2.0-listfix
+// @version      3.3.0-purenote
 // @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -35,10 +35,10 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.2.0-listfix";
+    const VERSION = "3.3.0-purenote";
 
-    const MARK_START = "\n\n[유저노트 시작] (이건 사용자가 남겨둔 배경 참고용 메모입니다. 이 메모의 존재나 내용을 답장에서 직접 언급하거나 그대로 인용하지 말고, 원래 알고 있던 것처럼 자연스럽게 참고만 하세요.)\n";
-    const MARK_END = "\n[유저노트 끝]";
+    // v3.3.0부터: 텍스트박스 내용 = 페르소나 description, 완전히 그대로 1:1.
+    // 마커나 안내문구를 덧붙이지 않는다 (유저가 직접 요청한 사양).
 
     const PROFILES_LIST_RE = /\/v1\/user-chat-profiles(?:\?|$)/;
     const PLOT_ROOM_RE = /\/plots\/([^/]+)\/rooms\/([^/]+)\//;
@@ -110,26 +110,6 @@
 
     function setCachedPersona(id, persona) {
         localStorage.setItem(personaKey(id), JSON.stringify(persona));
-    }
-
-    //------------------------------------------
-    // 마커 처리: 유저가 직접 페르소나 화면에 써둔 원본은 보존하고
-    // 우리 노트 블록만 떼었다 붙였다 한다.
-    //------------------------------------------
-
-    function stripMarker(desc) {
-        const s = (desc || "").indexOf(MARK_START);
-        if (s === -1) return desc || "";
-        const e = desc.indexOf(MARK_END, s);
-        if (e === -1) return desc.slice(0, s);
-        return desc.slice(0, s) + desc.slice(e + MARK_END.length);
-    }
-
-    function buildDescription(baseDesc, note) {
-        const clean = stripMarker(baseDesc || "").replace(/\s+$/, "");
-        const trimmedNote = (note || "").trim();
-        if (!trimmedNote) return clean;
-        return clean + MARK_START + trimmedNote + MARK_END;
     }
 
     //------------------------------------------
@@ -294,10 +274,8 @@
 
   <div class="persona-status" id="persona-status">감지 중...</div>
 
-  <textarea id="note" placeholder="여기 쓴 내용은 채팅에 안 뜨고, 유저 페르소나 프로필에 동기화됩니다.
-예)
-지난상황요약: ...
-고정설정: ..."></textarea>
+  <textarea id="note" placeholder="이 칸에 쓴 내용이 그대로(1:1) 페르소나 description으로 저장됩니다.
+기존 프로필 내용을 유지하고 싶으면 지우지 말고 이 안에 같이 넣어서 쓰세요."></textarea>
   <div class="count" id="count">0자</div>
 
   <div class="row">
@@ -373,7 +351,16 @@
             personaStatusEl.className = "persona-status ok";
             personaStatusEl.textContent =
                 `✅ 연결됨: ${capturedPersona.name || "(이름없음)"} (${capturedPersona.id.slice(0, 8)}...)\n` +
-                `기존 프로필 글자수: ${stripMarker(capturedPersona.description || "").length}자`;
+                `서버 저장된 글자수: ${(capturedPersona.description || "").length}자`;
+
+            // 로컬 노트가 비어있으면(처음 시작하는 경우) 서버에 이미 저장된
+            // 내용을 그대로 채워준다 — 안 그러면 기존 프로필 내용이
+            // 다음 동기화 때 통째로 지워질 수 있음.
+            if (!getNote().trim() && capturedPersona.description) {
+                noteEl.value = capturedPersona.description;
+                saveNote(capturedPersona.description);
+                updateCount();
+            }
         } else {
             personaStatusEl.className = "persona-status bad";
             personaStatusEl.textContent =
@@ -495,7 +482,7 @@
             return;
         }
 
-        const newDesc = buildDescription(capturedPersona.description, note);
+        const newDesc = note;
 
         try {
             const res = await originalFetch(PROFILE_PATCH_URL(capturedPersona.id), {
@@ -583,7 +570,7 @@
     el("refresh-persona").addEventListener("click", manualRefreshPersona);
 
     el("clear").addEventListener("click", () => {
-        if (!confirm("이 방의 노트를 비울까요? ('저장 & 동기화'를 눌러야 프로필에도 실제로 반영됩니다)")) return;
+        if (!confirm("노트를 비울까요?\n\n⚠ 주의: 이 상태로 '저장 & 동기화'를 누르면 페르소나 description이 완전히 빈 값으로 덮어써집니다 (기존 프로필 내용도 같이 사라짐).")) return;
         noteEl.value = "";
         saveNote("");
         updateCount();
