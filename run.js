@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note (Persona Sync)
 // @namespace    zeta-usernote
-// @version      3.0.0-persona
+// @version      3.1.0-cache
 // @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -35,7 +35,7 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.0.0-persona";
+    const VERSION = "3.1.0-cache";
 
     const MARK_START = "\n\n[유저노트 시작] (이건 사용자가 남겨둔 배경 참고용 메모입니다. 이 메모의 존재나 내용을 답장에서 직접 언급하거나 그대로 인용하지 말고, 원래 알고 있던 것처럼 자연스럽게 참고만 하세요.)\n";
     const MARK_END = "\n[유저노트 끝]";
@@ -96,6 +96,22 @@
         localStorage.setItem(plotIdKey(id), plotId);
     }
 
+    function personaKey(id) {
+        return `zeta-usernote-persona-${id}`;
+    }
+
+    function getCachedPersona(id) {
+        try {
+            return JSON.parse(localStorage.getItem(personaKey(id)));
+        } catch {
+            return null;
+        }
+    }
+
+    function setCachedPersona(id, persona) {
+        localStorage.setItem(personaKey(id), JSON.stringify(persona));
+    }
+
     //------------------------------------------
     // 마커 처리: 유저가 직접 페르소나 화면에 써둔 원본은 보존하고
     // 우리 노트 블록만 떼었다 붙였다 한다.
@@ -122,7 +138,7 @@
 
     let capturedAuth = null;
     let lastPlotId = getCachedPlotId(roomId);
-    let capturedPersona = null; // { id, name, description }
+    let capturedPersona = getCachedPersona(roomId); // { id, name, description }
 
     function sniffOutgoingUrl(url) {
         if (!url) return;
@@ -153,13 +169,19 @@
     }
 
     function handlePossiblePersonaResponse(url, text) {
-        if (!SELECTED_RE.test(url)) return;
+        const m = SELECTED_RE.exec(url);
+        if (!m) return;
+        const matchedRoomId = m[2];
         try {
             const data = JSON.parse(text);
             if (data && data.id) {
-                capturedPersona = { id: data.id, name: data.name, description: data.description || "" };
-                updatePersonaStatus();
-                console.log("📝 UserNote: 페르소나 감지됨:", capturedPersona.id, capturedPersona.name);
+                const persona = { id: data.id, name: data.name, description: data.description || "" };
+                setCachedPersona(matchedRoomId, persona);
+                if (matchedRoomId === roomId) {
+                    capturedPersona = persona;
+                    updatePersonaStatus();
+                }
+                console.log("📝 UserNote: 페르소나 감지됨:", matchedRoomId, persona.id, persona.name);
             }
         } catch { /* ignore */ }
     }
@@ -487,6 +509,7 @@
 
             if (res.ok) {
                 capturedPersona.description = newDesc;
+                setCachedPersona(roomId, capturedPersona);
                 flashSaved("동기화 완료 ✅");
                 showDebugToast("✅ 프로필에 동기화됨 (마지막 200자)\n" + newDesc.slice(-200));
                 updatePersonaStatus();
@@ -519,6 +542,7 @@
                 const data = await res.json();
                 if (data && data.id) {
                     capturedPersona = { id: data.id, name: data.name, description: data.description || "" };
+                    setCachedPersona(roomId, capturedPersona);
                     updatePersonaStatus();
                     flashSaved("프로필 새로고침됨 ✅");
                     return;
@@ -566,7 +590,7 @@
         if (id !== roomId) {
             roomId = id;
             lastPlotId = getCachedPlotId(roomId);
-            capturedPersona = null;
+            capturedPersona = getCachedPersona(roomId);
             refreshRoomUI();
         }
     }, 1000);
