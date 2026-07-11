@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note (Persona Sync)
 // @namespace    zeta-usernote
-// @version      3.1.0-cache
+// @version      3.1.1-debug
 // @description  유저가 쓴 노트를 채팅이 아니라 유저 페르소나(user-chat-profiles) API로 직접 동기화. 화면/대화기록에 전혀 안 남음.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -35,7 +35,7 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.1.0-cache";
+    const VERSION = "3.1.1-debug";
 
     const MARK_START = "\n\n[유저노트 시작] (이건 사용자가 남겨둔 배경 참고용 메모입니다. 이 메모의 존재나 내용을 답장에서 직접 언급하거나 그대로 인용하지 말고, 원래 알고 있던 것처럼 자연스럽게 참고만 하세요.)\n";
     const MARK_END = "\n[유저노트 끝]";
@@ -531,15 +531,19 @@
             return;
         }
         if (!lastPlotId) {
-            showDebugToast("⚠ plotId를 아직 못 찾았어요. 채팅방을 새로고침해주세요.");
-            flashSaved("실패 ❌");
+            showDebugToast("⚠ plotId를 아직 못 찾았어요 (null). 채팅방에서 스크롤하거나 메시지를 하나 보내본 뒤 다시 시도해주세요.");
+            flashSaved("실패 ❌ (plotId 없음)");
             return;
         }
+        const url = `https://api.zeta-ai.io/v1/plots/${lastPlotId}/rooms/${roomId}/user-personas/selected`;
         try {
-            const url = `https://api.zeta-ai.io/v1/plots/${lastPlotId}/rooms/${roomId}/user-personas/selected`;
             const res = await originalFetch(url, { headers: { "Authorization": capturedAuth } });
+            const bodyText = await res.text();
+
             if (res.ok) {
-                const data = await res.json();
+                let data = null;
+                try { data = JSON.parse(bodyText); } catch { /* ignore */ }
+
                 if (data && data.id) {
                     capturedPersona = { id: data.id, name: data.name, description: data.description || "" };
                     setCachedPersona(roomId, capturedPersona);
@@ -547,12 +551,21 @@
                     flashSaved("프로필 새로고침됨 ✅");
                     return;
                 }
+
+                flashSaved("새로고침 실패 ❌ (빈 응답)");
+                showDebugToast(
+                    "❌ 요청은 성공(200)했지만 페르소나 데이터가 없어요.\n" +
+                    "URL: " + url + "\n" +
+                    "응답: " + bodyText.slice(0, 200)
+                );
+                return;
             }
+
             flashSaved("새로고침 실패 ❌");
-            showDebugToast(`❌ 새로고침 실패 (HTTP ${res.status})`);
+            showDebugToast(`❌ 새로고침 실패 (HTTP ${res.status})\nURL: ${url}\n응답: ${bodyText.slice(0, 200)}`);
         } catch (err) {
             flashSaved("새로고침 실패 ❌");
-            showDebugToast("❌ 네트워크 오류: " + (err && err.message));
+            showDebugToast("❌ 네트워크 오류: " + (err && err.message) + "\nURL: " + url);
         }
     }
 
