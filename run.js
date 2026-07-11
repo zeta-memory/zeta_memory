@@ -590,6 +590,16 @@
 
                     const shouldInject = note && !alreadyTagged && (forceNext || (settings.enabled && delta >= threshold));
 
+                    // 디버그: 왜 삽입되고/안되는지 항상 보이게 (콘솔 레벨 필터 무시하고 뜨도록 warn 사용)
+                    console.warn("📝 [UserNote Debug] shouldInject=", shouldInject, {
+                        noteLen: note.length,
+                        alreadyTagged,
+                        forceNext,
+                        enabled: settings.enabled,
+                        delta,
+                        threshold
+                    });
+
                     if (shouldInject) {
                         bodyObj.text = `${NOTE_TAG} ${NOTE_INSTRUCTION}\n${note}\n\n[사용자 입력]\n${bodyObj.text}`;
                         init = Object.assign({}, init, { body: JSON.stringify(bodyObj) });
