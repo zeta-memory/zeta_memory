@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         Zeta User Note
+// @namespace    zeta-usernote
+// @version      2.2.0-xhr
+// @description  대화에 유저 노트를 몰래 끼워 넣는 스크립트
+// @match        https://zeta-ai.io/*
+// @match        https://*.zeta-ai.io/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
 (() => {
 
     "use strict";
@@ -19,7 +30,7 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "2.1.1-debug";
+    const VERSION = "2.2.0-xhr";
     const NOTE_TAG = "[유저 노트]";
     // 노트 앞에 붙는 안내문. 이 노트는 "기억"용일 뿐, 모델이 매번 대놓고
     // 인용하거나 반복해서 되짚는(=뇌절) 걸 막기 위한 지시를 함께 넣는다.
@@ -250,6 +261,21 @@
   .saved-badge { color: #7CFC9C; font-size: 10px; opacity: 0; transition: opacity .3s; white-space:nowrap; }
   .saved-badge.show { opacity: 1; }
 
+  #debug-toast {
+    position: fixed;
+    left: 8px; right: 8px; bottom: 8px;
+    background: #000; color: #7CFC9C;
+    font-family: monospace;
+    font-size: 10px; line-height: 1.4;
+    padding: 8px 10px; border-radius: 8px;
+    border: 1px solid #ff5d8f;
+    opacity: 0; pointer-events: none;
+    transition: opacity .3s;
+    white-space: pre-wrap; word-break: break-all;
+    z-index: 2147483647;
+  }
+  #debug-toast.show { opacity: 0.95; }
+
   .progress-label { display:flex; justify-content:space-between; font-size:10px; color:#999; margin-top:10px; }
   .progress-track { width:100%; height:6px; background:#333; border-radius:4px; overflow:hidden; margin-top:4px; }
   .progress-fill { height:100%; background:#ff5d8f; width:0%; transition: width .3s; }
@@ -259,6 +285,7 @@
 </style>
 
 <div id="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg><span class="dot"></span></div>
+<div id="debug-toast"></div>
 <div id="panel">
   <div class="title">
     <span>User Note</span>
@@ -348,6 +375,14 @@
         savedEl.classList.add("show");
         clearTimeout(flashSaved._t);
         flashSaved._t = setTimeout(() => savedEl.classList.remove("show"), 1400);
+    }
+
+    const debugToastEl = el("debug-toast");
+    function showDebugToast(text) {
+        debugToastEl.textContent = text;
+        debugToastEl.classList.add("show");
+        clearTimeout(showDebugToast._t);
+        showDebugToast._t = setTimeout(() => debugToastEl.classList.remove("show"), 6000);
     }
 
     function refreshProgress() {
@@ -562,7 +597,42 @@
     progressObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 
     //------------------------------------------
-    // fetch 가로채기: 입력창에는 안 보이고, 전송되는 요청에만 삽입
+    // 삽입 판단 공통 로직 (fetch/XHR 둘 다에서 재사용)
+    //------------------------------------------
+
+    function decideAndBuildInjectedText(originalText) {
+        const settings = getSettings();
+        const note = getNote().trim();
+        const alreadyTagged = originalText.startsWith(NOTE_TAG);
+        const { delta, threshold, messages } = getProgress();
+
+        const shouldInject = note && !alreadyTagged && (forceNext || (settings.enabled && delta >= threshold));
+
+        if (shouldInject) {
+            const newText = `${NOTE_TAG} ${NOTE_INSTRUCTION}\n${note}\n\n[사용자 입력]\n${originalText}`;
+
+            // 삽입한 시점을 새 기준점으로 다시 잡는다 (진행도 리셋)
+            setCheckpoint(messages);
+            forceNext = false;
+
+            console.log("📝 User Note 삽입됨 (진행도 리셋):", newText.slice(0, 80) + "...");
+            showDebugToast("✅ 삽입됨\n실제 전송된 첫 90자:\n" + newText.slice(0, 90));
+            if (panelEl.classList.contains("open")) {
+                flashSaved("노트 삽입됨");
+                refreshProgress();
+            }
+            return newText;
+        }
+
+        showDebugToast(
+            "⏭ 삽입 안 함\n" +
+            `noteLen=${note.length} alreadyTagged=${alreadyTagged} forceNext=${forceNext} enabled=${settings.enabled} delta=${delta}/${threshold}`
+        );
+        return null;
+    }
+
+    //------------------------------------------
+    // fetch 가로채기 (일부 요청이 fetch로 나가는 경우 대비)
     //------------------------------------------
 
     const originalFetch = window.fetch;
@@ -571,7 +641,6 @@
 
         try {
             const url = typeof input === "string" ? input : (input && input.url) || "";
-            console.warn("📝 [UserNote Debug] fetch 호출 감지:", url.slice(0, 90));
             const method = (
                 (init && init.method) ||
                 (typeof input !== "string" && input && input.method) ||
@@ -583,45 +652,58 @@
                 const bodyObj = JSON.parse(init.body);
 
                 if (bodyObj && bodyObj.type === "TEXT" && typeof bodyObj.text === "string") {
-
-                    const settings = getSettings();
-                    const note = getNote().trim();
-                    const alreadyTagged = bodyObj.text.startsWith(NOTE_TAG);
-                    const { delta, threshold, messages } = getProgress();
-
-                    const shouldInject = note && !alreadyTagged && (forceNext || (settings.enabled && delta >= threshold));
-
-                    // 디버그: 왜 삽입되고/안되는지 항상 보이게 (콘솔 레벨 필터 무시하고 뜨도록 warn 사용)
-                    console.warn("📝 [UserNote Debug] shouldInject=", shouldInject, {
-                        noteLen: note.length,
-                        alreadyTagged,
-                        forceNext,
-                        enabled: settings.enabled,
-                        delta,
-                        threshold
-                    });
-
-                    if (shouldInject) {
-                        bodyObj.text = `${NOTE_TAG} ${NOTE_INSTRUCTION}\n${note}\n\n[사용자 입력]\n${bodyObj.text}`;
+                    const newText = decideAndBuildInjectedText(bodyObj.text);
+                    if (newText !== null) {
+                        bodyObj.text = newText;
                         init = Object.assign({}, init, { body: JSON.stringify(bodyObj) });
-
-                        // 삽입한 시점을 새 기준점으로 다시 잡는다 (진행도 리셋)
-                        setCheckpoint(messages);
-                        forceNext = false;
-
-                        console.log("📝 User Note 삽입됨 (진행도 리셋):", bodyObj.text.slice(0, 80) + "...");
-                        if (panelEl.classList.contains("open")) {
-                            flashSaved("노트 삽입됨");
-                            refreshProgress();
-                        }
                     }
                 }
             }
         } catch (err) {
-            console.error("❌ User Note 처리 실패, 원본 요청 그대로 전송", err);
+            console.error("❌ User Note 처리 실패 (fetch), 원본 요청 그대로 전송", err);
         }
 
         return originalFetch.call(this, input, init);
+    };
+
+    //------------------------------------------
+    // XMLHttpRequest 가로채기
+    // (제타는 자체 API 호출에 fetch 대신 XHR을 쓰는 것으로 확인됨 —
+    //  fetch만 가로채서는 stream 요청을 절대 못 잡는다)
+    //------------------------------------------
+
+    const OrigXHR = window.XMLHttpRequest;
+    const origOpen = OrigXHR.prototype.open;
+    const origSend = OrigXHR.prototype.send;
+
+    OrigXHR.prototype.open = function (method, url, ...rest) {
+        this.__zetaMethod = (method || "GET").toUpperCase();
+        this.__zetaURL = url;
+        return origOpen.call(this, method, url, ...rest);
+    };
+
+    OrigXHR.prototype.send = function (body) {
+        try {
+            if (
+                this.__zetaMethod === "POST" &&
+                STREAM_URL_RE.test(this.__zetaURL || "") &&
+                typeof body === "string"
+            ) {
+                const bodyObj = JSON.parse(body);
+
+                if (bodyObj && bodyObj.type === "TEXT" && typeof bodyObj.text === "string") {
+                    const newText = decideAndBuildInjectedText(bodyObj.text);
+                    if (newText !== null) {
+                        bodyObj.text = newText;
+                        body = JSON.stringify(bodyObj);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("❌ User Note 처리 실패 (XHR), 원본 요청 그대로 전송", err);
+        }
+
+        return origSend.call(this, body);
     };
 
     //------------------------------------------
