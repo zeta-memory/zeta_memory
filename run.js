@@ -44,7 +44,7 @@
     }
     window.__ZETA_USERNOTE_RUNNING__ = true;
 
-    const VERSION = "3.5.1-autosync-toggle";
+    const VERSION = "3.5.3-fix-tdz";
     const DEBUG = true; // 콘솔(F12)에 plotId/roomId 감지 로그를 남길지 여부
 
     const PROFILES_LIST_RE = /\/v1\/user-chat-profiles(?:\?|$)/;
@@ -153,6 +153,7 @@
     let capturedAuth = null;
     let lastPlotId = getCachedPlotId(roomId);
     let capturedPersona = getCachedPersona(roomId); // { id, name, description }
+    let autoSyncTimer = null; // ★ v3.5.3: refreshRoomUI()가 이 함수 정의보다 먼저 실행돼서 TDZ 에러가 났던 것 수정 (선언을 위로 이동)
 
     function sniffOutgoingUrl(url) {
         if (!url) return;
@@ -613,7 +614,6 @@
     }
 
     // ★ v3.5: 자동 동기화. 서버에 저장된 description이 이미 base+note와 같으면 아무 것도 안 함(불필요한 PATCH 방지).
-    let autoSyncTimer = null;
     function maybeAutoSync() {
         if (!isAutoSyncEnabled()) return; // ★ 토글 OFF면 자동으로는 절대 서버에 안 씀
         clearTimeout(autoSyncTimer);
