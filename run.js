@@ -571,6 +571,7 @@
 
         try {
             const url = typeof input === "string" ? input : (input && input.url) || "";
+            console.warn("📝 [UserNote Debug] fetch 호출 감지:", url.slice(0, 90));
             const method = (
                 (init && init.method) ||
                 (typeof input !== "string" && input && input.method) ||
