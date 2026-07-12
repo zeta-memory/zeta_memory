@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.5.1
+// @version      1.6.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.5.1";
+  const VERSION = "1.6.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -481,10 +481,15 @@
       "3. 문체, 어투, 인칭, 문단 구성, 대사와 지문 배치, 상태창 라벨/형식은 절대 건드리지 않는다.",
       "4. find는 [제타 원본 답변]에 있는 문자열을 한 글자도 틀리지 않고 그대로 옮겨 적어야 한다 (요약·의역 금지).",
       "   상태창 값을 고칠 때도 'label: ' 부분은 빼고 값(value) 부분만 find로 잡는다.",
-      "5. find는 원본 안에서 유일하게 특정되어야 한다. 같은 문구가 반복되는 곳이면 앞뒤 맥락을 포함해 더 길게 잡는다.",
+      "5. find가 원본 안에 여러 번 나올 수 있다. 그 경우 모든 위치에 같은 replace를 적용해도 뜻이 통하는 문구로 find를 잡는다.",
+      "   (문맥에 따라 다르게 고쳐야 하는 상황이면, 그 문맥까지 포함해서 find를 더 길고 구체적으로 잡아 그 자리만 특정한다.)",
       "6. replace는 모순만 해소하도록 최소한으로 고친 문장/값이며, 원본의 문체와 어울려야 한다.",
-      "7. 모순이 없으면 conflicts를 빈 배열로 반환한다.",
-      "8. 반드시 아래 JSON 형식 하나만 반환한다. 다른 설명이나 사과를 덧붙이지 않는다.",
+      "7. 유저노트 문장에 '어제/오늘/방금/지금' 같은 시간 표현이 있으면, 그 문장이 뜻하는 현재 상태까지 추론해서 대조한다.",
+      "   (예: 노트에 '어제 부산에 놀러갔다가 오늘 집에 옴'이라고 적혀있는데, 원본 답변이 화자가 여전히 부산에 있는 것처럼",
+      "   서술하면 -- '지금은 집에 있어야 한다'는 함의와 모순되는 것으로 본다.) 단, 노트에 안 적힌 화제까지 추측해서",
+      "   새로 만들어내지는 않는다 -- 오직 노트 문장이 실제로 뜻하는 현재 상태와의 모순만 본다.",
+      "8. 모순이 없으면 conflicts를 빈 배열로 반환한다.",
+      "9. 반드시 아래 JSON 형식 하나만 반환한다. 다른 설명이나 사과를 덧붙이지 않는다.",
       "",
       '{"conflicts":[{"find":"원본 그대로의 문자열","replace":"고친 문자열","reason":"어떤 노트 내용과 왜 모순인지"}]}'
     ].join("\n");
@@ -514,8 +519,9 @@
       const replace = c && typeof c.replace === "string" ? c.replace : "";
       if (!find) { skipped.push({ ...c, why: "find 없음" }); return; }
       const occurrences = result.split(find).length - 1;
-      if (occurrences !== 1) { skipped.push({ ...c, why: occurrences === 0 ? "원본에서 못 찾음" : "원본에 " + occurrences + "번 나와서 특정 불가" }); return; }
-      result = result.replace(find, replace);
+      if (occurrences === 0) { skipped.push({ ...c, why: "원본에서 못 찾음" }); return; }
+      // 같은 문구가 여러 번 나와도, replace 값은 항상 동일하게 적용되므로 전부 바꿔도 안전하다.
+      result = result.split(find).join(replace);
       applied.push(c);
     });
     return { result, applied, skipped };
@@ -552,7 +558,7 @@
 
   function replaceWithinString(str, original, revised) {
     if (str === original) return revised;
-    if (str.includes(original)) return str.replace(original, revised);
+    if (str.includes(original)) return str.split(original).join(revised);
     const strNorm = normalizeSpace(str);
     const targetNorm = normalizeSpace(original);
     if (!targetNorm) return undefined;
@@ -560,7 +566,7 @@
     if (strNorm.includes(targetNorm) && str.length >= original.length * 0.5) {
       const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
       let re = null;
-      try { re = new RegExp(escaped); } catch { re = null; }
+      try { re = new RegExp(escaped, "g"); } catch { re = null; }
       if (re && re.test(str)) return str.replace(re, revised);
     }
     return undefined;
@@ -890,7 +896,7 @@
       if (ok) patchedAny = true;
     });
     if (patchedAny) {
-      toast("✅ 유저노트 기준으로 " + outcome.applied.length + "곳 수정함", false);
+      if (debug) toast("✅ 유저노트 기준으로 " + outcome.applied.length + "곳 수정함", false);
     } else if (debug) {
       const dbg = window.__ZETA_UNC_LAST_DEBUG__ || {};
       toast("⚠ 수정은 계산됐지만 화면 요소를 못 찾음 (shadowRoots:" + (dbg.shadowRoots != null ? dbg.shadowRoots : "?") + ")", true);
@@ -976,7 +982,7 @@
       const patchResult = applyCorrectionsToRawText(rawText, outcome.applied);
       if (patchResult.changed) {
         recordCorrections(roomId, outcome.applied);
-        toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (네트워크 응답에 반영)", false);
+        if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (네트워크 응답에 반영)", false);
         return passthroughResponse(response, patchResult.text);
       }
       if (debug) toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
@@ -1167,7 +1173,7 @@
               if (patched.changed) {
                 finalText = patched.text;
                 recordCorrections(roomId, outcome.applied);
-                toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
+                if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
               } else if (debug) {
                 toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
               }
@@ -1283,7 +1289,7 @@
       <input type="checkbox" id="enabled" style="width:auto;margin:0;">
       <label style="margin:0;">이 방에서 노트 반영 사용</label>
     </div>
-    <textarea id="note" placeholder="예) {{user}}의 생일은 5월 5일이다.&#10;어제 저녁 메뉴로 싸운 뒤 아직 화해 안 함, 서먹함.&#10;&#10;- 명백히 모순되는 답변만 고쳐집니다.&#10;- 글자수 제한 없음."></textarea>
+    <textarea id="note" placeholder="유저노트 글자수가 늘어나면 API 설정란의 토큰 사용량도 같이 늘어납니다.&#10;글자수/비용은 API 설정 탭에서 확인하며 조절하세요.&#10;&#10;출력 방식/규칙(예: 짧게 출력, 내레이션 금지 등)은 이 기능으로는 반영되지 않습니다."></textarea>
     <div class="count" id="count">0자</div>
     <div class="row">
       <button class="primary" id="saveNote">저장</button>
@@ -1320,7 +1326,7 @@
     <div class="status" id="apiStatus">아직 테스트 안 함</div>
 
     <hr>
-    <label style="margin-top:0;">토큰 사용량 (제타 토큰 아님, 이 API 호출분)</label>
+    <label style="margin-top:0;">토큰 사용량</label>
     <div class="status" id="tokenStatus">집계 없음</div>
     <div class="row">
       <button id="resetTokens">이 방 토큰 집계 초기화</button>
@@ -1448,12 +1454,18 @@
     btnEl.classList.toggle("ready", !!getActivePreset(roomId));
   }
 
+  const PRESET_DEFAULTS = {
+    provider: "compatible",
+    model: "gemma-4-31b",
+    baseUrl: "https://api.cerebras.ai/v1/chat/completions"
+  };
+
   function loadPresetIntoForm(preset) {
     presetNameEl.value = preset ? preset.name || "" : "";
-    providerEl.value = preset ? preset.provider || "gemini" : "gemini";
+    providerEl.value = preset ? preset.provider || PRESET_DEFAULTS.provider : PRESET_DEFAULTS.provider;
     apiKeyEl.value = preset ? preset.apiKey || "" : "";
-    modelEl.value = preset ? preset.model || "" : "";
-    baseUrlEl.value = preset ? preset.baseUrl || "" : "";
+    modelEl.value = preset ? preset.model || PRESET_DEFAULTS.model : PRESET_DEFAULTS.model;
+    baseUrlEl.value = preset ? preset.baseUrl || PRESET_DEFAULTS.baseUrl : PRESET_DEFAULTS.baseUrl;
     baseUrlWrapEl.classList.toggle("hidden", providerEl.value !== "compatible");
     apiStatusEl.className = "status";
     apiStatusEl.textContent = "아직 테스트 안 함";
@@ -1471,7 +1483,11 @@
 
   el("newPreset").addEventListener("click", () => {
     const list = getPresets();
-    const preset = { id: uuid(), name: "새 프리셋", provider: "gemini", apiKey: "", model: "", baseUrl: "" };
+    const preset = {
+      id: uuid(), name: "새 프리셋",
+      provider: PRESET_DEFAULTS.provider, apiKey: "",
+      model: PRESET_DEFAULTS.model, baseUrl: PRESET_DEFAULTS.baseUrl
+    };
     list.push(preset);
     savePresets(list);
     setActivePresetId(roomId, preset.id);
