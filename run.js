@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.2.0
+// @version      1.3.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.2.0";
+  const VERSION = "1.3.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -183,6 +183,21 @@
     return m ? decodeURIComponent(m[1]) : "";
   }
 
+  // api.zeta-ai.io로 나가는 요청인지 (스트림 엔드포인트가 아닌 다른 API들도 포함해서 넓게 판별)
+  function isZetaApiHost(url) {
+    try {
+      const target = new URL(String(url || ""), location.href);
+      return target.hostname === "api.zeta-ai.io";
+    } catch { return false; }
+  }
+
+  // /v1/rooms/:roomId/... 형태의 어떤 API 경로에서든 roomId를 뽑아낸다 (스트림 엔드포인트에 한정하지 않음).
+  function broaderRoomIdFromUrl(url) {
+    const m = String(url || "").match(/\/v1\/rooms\/([^/]+)/i);
+    if (m) return decodeURIComponent(m[1]);
+    return currentRoomId();
+  }
+
   function requestBodyText(body) {
     if (typeof body === "string") return body;
     return "";
@@ -218,6 +233,37 @@
   }
   function setEnabled(roomId, on) {
     localStorage.setItem(LS_ENABLED_PREFIX + roomId, on ? "1" : "0");
+  }
+
+  // ---- 이미 적용했던 교정 내용 기억 (스트림 이후 다른 API가 원본으로 덮어쓰는 것을 방지) ----
+  const LS_CORR_PREFIX = "zeta-unc-corrections-";
+
+  function recordCorrections(roomId, applied) {
+    if (!roomId || !Array.isArray(applied) || !applied.length) return;
+    const key = LS_CORR_PREFIX + roomId;
+    const list = safeJsonParse(localStorage.getItem(key), []) || [];
+    applied.forEach((c) => {
+      if (!c || typeof c.find !== "string" || typeof c.replace !== "string" || !c.find) return;
+      const idx = list.findIndex((x) => x.find === c.find);
+      if (idx !== -1) list[idx] = { find: c.find, replace: c.replace, ts: Date.now() };
+      else list.push({ find: c.find, replace: c.replace, ts: Date.now() });
+    });
+    while (list.length > 300) list.shift();
+    try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
+  }
+
+  // 모든 방에서 지금까지 적용됐던 교정 내용을 전부 모아온다 (find 기준 중복 제거, 최신이 우선).
+  function getAllCorrections() {
+    const map = new Map();
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || k.indexOf(LS_CORR_PREFIX) !== 0) continue;
+        const list = safeJsonParse(localStorage.getItem(k), []) || [];
+        list.forEach((c) => { if (c && c.find && typeof c.replace === "string") map.set(c.find, c.replace); });
+      }
+    } catch {}
+    return Array.from(map, ([find, replace]) => ({ find, replace }));
   }
 
   function getPresets() {
@@ -480,6 +526,40 @@
     return { text: rebuilt.join(""), changed: changedAny };
   }
 
+  // 스트림 응답이 아닌 "일반 JSON" 응답(예: 대화 이력 재조회 등)에 대해,
+  // 이미 예전에 적용했던 교정들을 AI 호출 없이 그대로 재적용한다.
+  // - 몸통 전체가 JSON으로 파싱되면 그 구조를 그대로 걸어다니며 문자열 치환.
+  // - 아니라면 SSE 스타일 응답일 수 있으니 patchRawSseText 로직을 각 교정마다 순서대로 적용.
+  function patchGenericJsonText(rawText, corrections) {
+    if (!Array.isArray(corrections) || !corrections.length) return { text: rawText, changed: false };
+
+    const whole = safeJsonParse(rawText, null);
+    if (whole !== null && typeof whole === "object") {
+      let changed = false;
+      walkMutableStrings(whole, (str) => {
+        let cur = str;
+        let localChanged = false;
+        corrections.forEach((c) => {
+          const res = replaceWithinString(cur, c.find, c.replace);
+          if (res !== undefined) { cur = res; localChanged = true; }
+        });
+        if (localChanged) { changed = true; return cur; }
+        return undefined;
+      });
+      if (!changed) return { text: rawText, changed: false };
+      try { return { text: JSON.stringify(whole), changed: true }; }
+      catch { return { text: rawText, changed: false }; }
+    }
+
+    let text = rawText;
+    let changedAny = false;
+    corrections.forEach((c) => {
+      const res = patchRawSseText(text, c.find, c.replace);
+      if (res.changed) { text = res.text; changedAny = true; }
+    });
+    return { text, changed: changedAny };
+  }
+
   // ==========================================================
   // 4. 화면에 보이는 답변 교체 (텍스트만 치환, DOM 구조는 안 건드림) — 최후의 폴백
   // ==========================================================
@@ -707,7 +787,26 @@
     const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
     const isStream = isStreamEndpoint(url, method);
 
-    if (!isStream) return originalFetch(input, init);
+    if (!isStream) {
+      // 스트림 엔드포인트가 아닌 다른 zeta API 응답(예: 대화 이력 재조회)도,
+      // 예전에 적용했던 교정이 있다면 AI 호출 없이 그대로 재적용한다.
+      // 이렇게 해야 스트리밍이 끝난 뒤 다른 API가 원본 텍스트로 화면을 덮어쓰는 것을 막을 수 있다.
+      if (!isZetaApiHost(url)) return originalFetch(input, init);
+      const corrections = getAllCorrections();
+      if (!corrections.length) return originalFetch(input, init);
+
+      const response = await originalFetch(input, init);
+      if (!response.ok) return response;
+      let rawText;
+      try { rawText = await response.text(); } catch { return response; }
+      try {
+        const patched = patchGenericJsonText(rawText, corrections);
+        if (patched.changed) return passthroughResponse(response, patched.text);
+        return passthroughResponse(response, rawText);
+      } catch {
+        return passthroughResponse(response, rawText);
+      }
+    }
 
     let userText = "";
     try {
@@ -749,6 +848,7 @@
 
       const patchResult = patchRawSseText(rawText, envelope.text, outcome.result);
       if (patchResult.changed) {
+        recordCorrections(roomId, outcome.applied);
         toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (네트워크 응답에 반영)", false);
         return passthroughResponse(response, patchResult.text);
       }
@@ -834,7 +934,49 @@
 
   OrigXHR.prototype.send = function (body) {
     const isStream = isStreamEndpoint(this.__uncUrl, this.__uncMethod);
-    if (!isStream) return origSend.call(this, body);
+
+    if (!isStream) {
+      // 스트림이 아닌 다른 zeta API 요청(예: 대화 이력 재조회)도, 예전에 적용했던
+      // 교정이 있으면 AI 호출 없이 그대로 재적용한다. 기록된 교정이 전혀 없으면
+      // 평범하게 원래 XHR 그대로 보내서(빠르고 안전) 아무것도 건드리지 않는다.
+      if (!isZetaApiHost(this.__uncUrl)) return origSend.call(this, body);
+      const corrections = getAllCorrections();
+      if (!corrections.length) return origSend.call(this, body);
+
+      const xhrInstance = this;
+      const gUrl = xhrInstance.__uncUrl;
+      const gHeaders = xhrInstance.__uncHeaders || {};
+      const gWithCreds = !!xhrInstance.withCredentials;
+      (async () => {
+        let response;
+        try {
+          response = await originalFetch(gUrl, {
+            method: xhrInstance.__uncMethod || "GET",
+            headers: gHeaders,
+            body,
+            credentials: gWithCreds ? "include" : "same-origin"
+          });
+        } catch (err) {
+          dispatchXhrLifecycle(xhrInstance, { networkError: true });
+          return;
+        }
+        let rawText = "";
+        try { rawText = await response.text(); } catch {}
+        let finalText = rawText;
+        try {
+          const patched = patchGenericJsonText(rawText, corrections);
+          if (patched.changed) finalText = patched.text;
+        } catch {}
+        dispatchXhrLifecycle(xhrInstance, {
+          status: response.status,
+          statusText: response.statusText,
+          responseURL: response.url || gUrl,
+          headers: response.headers,
+          bodyText: finalText
+        });
+      })();
+      return;
+    }
 
     const url = this.__uncUrl;
     const roomId = roomIdFromUrl(url);
@@ -897,6 +1039,7 @@
               const patched = patchRawSseText(rawText, envelope.text, outcome.result);
               if (patched.changed) {
                 finalText = patched.text;
+                recordCorrections(roomId, outcome.applied);
                 toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
               } else if (debug) {
                 toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
