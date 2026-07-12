@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.5.0
+// @version      1.5.1
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.5.0";
+  const VERSION = "1.5.1";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -617,6 +617,20 @@
     return { text: rebuilt.join(""), changed: changedAny };
   }
 
+  // envelope.text는 TEXT+INFO_BOX를 합친 "합성 텍스트"라서, 원본 응답 어디에도
+  // 통째로는 존재하지 않는다 (실제 JSON은 대사/상태창이 서로 다른 필드에 나뉘어 있음).
+  // 그래서 AI가 제안한 find/replace 쌍을 하나씩 개별적으로 raw 텍스트에 적용해야 한다.
+  function applyCorrectionsToRawText(rawText, appliedList) {
+    let text = rawText;
+    let changedAny = false;
+    (Array.isArray(appliedList) ? appliedList : []).forEach((c) => {
+      if (!c || typeof c.find !== "string" || typeof c.replace !== "string") return;
+      const r = patchRawSseText(text, c.find, c.replace);
+      if (r.changed) { text = r.text; changedAny = true; }
+    });
+    return { text, changed: changedAny };
+  }
+
   // 스트림 응답이 아닌 "일반 JSON" 응답(예: 대화 이력 재조회 등)에 대해,
   // 이미 예전에 적용했던 교정들을 AI 호출 없이 그대로 재적용한다.
   // - 몸통 전체가 JSON으로 파싱되면 그 구조를 그대로 걸어다니며 문자열 치환.
@@ -870,8 +884,12 @@
     const outcome = await computeCorrection(roomId, userText, envelope.text);
     if (outcome.skip) return;
 
-    const patched = patchVisibleReply(envelope.text, outcome.result, envelope.messageId, envelope.candidateId);
-    if (patched) {
+    let patchedAny = false;
+    (outcome.applied || []).forEach((c) => {
+      const ok = patchVisibleReply(c.find, c.replace, envelope.messageId, envelope.candidateId);
+      if (ok) patchedAny = true;
+    });
+    if (patchedAny) {
       toast("✅ 유저노트 기준으로 " + outcome.applied.length + "곳 수정함", false);
     } else if (debug) {
       const dbg = window.__ZETA_UNC_LAST_DEBUG__ || {};
@@ -955,7 +973,7 @@
       const outcome = await computeCorrection(roomId, userText, envelope.text);
       if (outcome.skip) return passthroughResponse(response, rawText);
 
-      const patchResult = patchRawSseText(rawText, envelope.text, outcome.result);
+      const patchResult = applyCorrectionsToRawText(rawText, outcome.applied);
       if (patchResult.changed) {
         recordCorrections(roomId, outcome.applied);
         toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (네트워크 응답에 반영)", false);
@@ -1145,7 +1163,7 @@
             }
             const outcome = await computeCorrection(roomId, userText, envelope.text);
             if (!outcome.skip) {
-              const patched = patchRawSseText(rawText, envelope.text, outcome.result);
+              const patched = applyCorrectionsToRawText(rawText, outcome.applied);
               if (patched.changed) {
                 finalText = patched.text;
                 recordCorrections(roomId, outcome.applied);
