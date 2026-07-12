@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.7.0
+// @version      1.7.1
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.7.0";
+  const VERSION = "1.7.1";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -908,6 +908,13 @@
         const reasons = skipped.map((s) => (s.find || "").slice(0, 20) + "→" + s.why).join(" / ");
         if (debug) toast("⚠ AI가 " + skipped.length + "건 제안했지만 전부 안전상 폐기됨: " + reasons, true);
         return { skip: true };
+      }
+      if (debug) {
+        const detail = applied.map((c) =>
+          `find: "${(c.find || "").slice(0, 60)}"\n→ replace: "${(c.replace || "").slice(0, 60)}"\n이유: ${c.reason || "(이유 없음)"}`
+        ).join("\n\n");
+        console.log("📝 UserNoteCorrector 수정 상세:", applied);
+        toast("🔧 " + applied.length + "곳 수정됨 (화자: " + (speakerNames && speakerNames.length ? speakerNames.join(",") : "?") + ")\n\n" + detail, false);
       }
       return { skip: false, result, applied, skipped };
     } catch (err) {
