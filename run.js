@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.0.0
+// @version      1.0.1
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.1";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -398,17 +398,31 @@
       return String(value || "").replace(/["\\]/g, "\\$&");
     }
 
-    function leafCandidates(nodes) {
+    // 이전 버전에는 "자식 엘리먼트가 없는 leaf 노드만" 후보로 삼는 조건이 있었는데,
+    // 지문(이탤릭)과 대사가 여러 자식 태그로 나뉘어 있는 답변에서는 그 조건 때문에
+    // 텍스트 전체를 담은 요소도, 텍스트 일부만 담은 leaf 요소도 둘 다 targetNorm과
+    // 정확히 일치하지 않아 아무것도 못 찾는 문제가 있었다. 그래서 "자식이 있어도 되고,
+    // 대신 textContent가 정확히 일치하는 요소들 중 가장 좁게 감싸는 요소"를 고르는
+    // 방식으로 바꿨다.
+    function candidateElements(nodes) {
       const out = [];
       for (let i = 0; i < nodes.length; i++) {
         const el = nodes[i];
         if (!el || !el.isConnected) continue;
         if (el.id === HOST_ID || (el.closest && el.closest("#" + HOST_ID))) continue;
         if (el.isContentEditable || /^(SCRIPT|STYLE|TEXTAREA|INPUT|BUTTON)$/.test(el.tagName)) continue;
-        if (el.childElementCount !== 0) continue; // 여러 메시지를 감싼 컨테이너는 절대 통째로 안 바꿈
         out.push(el);
       }
       return out;
+    }
+
+    function pickTightestMatch(pool) {
+      const matches = pool.filter((el) => normalizeSpace(el.textContent || "") === targetNorm);
+      if (!matches.length) return null;
+      // 자손 엘리먼트 수가 가장 적은(=텍스트를 가장 좁게 감싸는) 요소를 고른다.
+      // 여러 메시지를 통째로 감싼 큰 컨테이너가 잘못 선택되는 것을 막는다.
+      matches.sort((a, b) => a.querySelectorAll("*").length - b.querySelectorAll("*").length);
+      return matches[0];
     }
 
     function findTarget() {
@@ -419,18 +433,18 @@
         if (candidateId) selectors.push('[data-candidate-id="' + escapeAttr(candidateId) + '"]', '[data-candidate-uuid="' + escapeAttr(candidateId) + '"]');
         selectors.forEach((sel) => { try { roots = roots.concat(Array.from(document.querySelectorAll(sel))); } catch {} });
       }
-      let pool = roots.length ? leafCandidates(roots.flatMap((r) => (r.querySelectorAll ? Array.from(r.querySelectorAll("*")).concat([r]) : [r])))
+      let pool = roots.length ? candidateElements(roots.flatMap((r) => (r.querySelectorAll ? Array.from(r.querySelectorAll("*")).concat([r]) : [r])))
         : [];
-      let match = pool.find((el) => normalizeSpace(el.textContent || "") === targetNorm);
+      let match = pickTightestMatch(pool);
       if (match) return match;
 
       const semantic = document.querySelectorAll('article,[role="article"],[role="listitem"],[data-message-id],[class*="message"],[class*="bubble"],p');
-      const semanticLeaf = leafCandidates(Array.from(semantic).slice(-200));
-      match = semanticLeaf.find((el) => normalizeSpace(el.textContent || "") === targetNorm);
+      const semanticPool = candidateElements(Array.from(semantic).slice(-200));
+      match = pickTightestMatch(semanticPool);
       if (match) return match;
 
-      const broad = leafCandidates(Array.from(document.querySelectorAll("div,span,p,section,article")).slice(-300));
-      return broad.find((el) => normalizeSpace(el.textContent || "") === targetNorm) || null;
+      const broad = candidateElements(Array.from(document.querySelectorAll("div,span,p,section,article,em,i,strong,b")).slice(-400));
+      return pickTightestMatch(broad);
     }
 
     const el = findTarget();
