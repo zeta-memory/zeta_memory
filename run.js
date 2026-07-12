@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.4.0
+// @version      1.5.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.4.0";
+  const VERSION = "1.5.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -303,6 +303,39 @@
     return Array.from(map, ([find, replace]) => ({ find, replace }));
   }
 
+  // ---- 유저노트 대조용 AI 호출이 실제로 소비한 토큰(제타 토큰 아님, 연결한 API 쪽) 누적 집계 ----
+  const LS_TOKEN_PREFIX = "zeta-unc-tokens-";
+  const LS_TOKEN_GLOBAL_KEY = "zeta-unc-tokens-global";
+
+  function getTokenStats(key) {
+    return safeJsonParse(localStorage.getItem(key), null) || { input: 0, output: 0, total: 0, calls: 0 };
+  }
+  function addTokenUsage(key, usage) {
+    const cur = getTokenStats(key);
+    cur.input += usage.input || 0;
+    cur.output += usage.output || 0;
+    cur.total += usage.total || ((usage.input || 0) + (usage.output || 0));
+    cur.calls += 1;
+    try { localStorage.setItem(key, JSON.stringify(cur)); } catch {}
+    return cur;
+  }
+  function recordTokenUsage(roomId, usage) {
+    if (!usage) return { global: getTokenStats(LS_TOKEN_GLOBAL_KEY), room: roomId ? getTokenStats(LS_TOKEN_PREFIX + roomId) : null };
+    const global = addTokenUsage(LS_TOKEN_GLOBAL_KEY, usage);
+    const room = roomId ? addTokenUsage(LS_TOKEN_PREFIX + roomId, usage) : null;
+    return { global, room };
+  }
+  function resetTokenStats(roomId) {
+    localStorage.removeItem(LS_TOKEN_GLOBAL_KEY);
+    if (roomId) localStorage.removeItem(LS_TOKEN_PREFIX + roomId);
+    else {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf(LS_TOKEN_PREFIX) === 0) localStorage.removeItem(k);
+      }
+    }
+  }
+
   function getPresets() {
     return safeJsonParse(localStorage.getItem(LS_PRESETS_KEY), []) || [];
   }
@@ -349,7 +382,13 @@
       const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
       const text = Array.isArray(parts) ? parts.map((p) => p.text || "").join("") : "";
       if (!text) throw new Error("Gemini 응답에서 텍스트를 찾지 못했습니다.");
-      return text;
+      const um = data && data.usageMetadata;
+      const usage = um ? {
+        input: um.promptTokenCount || 0,
+        output: um.candidatesTokenCount || 0,
+        total: um.totalTokenCount || ((um.promptTokenCount || 0) + (um.candidatesTokenCount || 0))
+      } : null;
+      return { text, usage };
     }
 
     if (provider === "openai" || provider === "compatible") {
@@ -378,7 +417,13 @@
       if (!res.ok) throw new Error("API 오류 (" + res.status + "): " + (data && data.error && data.error.message || res.statusText));
       const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
       if (!text) throw new Error("응답에서 텍스트를 찾지 못했습니다.");
-      return text;
+      const u2 = data && data.usage;
+      const usage = u2 ? {
+        input: u2.prompt_tokens || 0,
+        output: u2.completion_tokens || 0,
+        total: u2.total_tokens || ((u2.prompt_tokens || 0) + (u2.completion_tokens || 0))
+      } : null;
+      return { text, usage };
     }
 
     if (provider === "anthropic") {
@@ -402,15 +447,21 @@
       if (!res.ok) throw new Error("Claude 오류 (" + res.status + "): " + (data && data.error && data.error.message || res.statusText));
       const text = data && Array.isArray(data.content) ? data.content.map((c) => c.text || "").join("") : "";
       if (!text) throw new Error("Claude 응답에서 텍스트를 찾지 못했습니다.");
-      return text;
+      const u3 = data && data.usage;
+      const usage = u3 ? {
+        input: u3.input_tokens || 0,
+        output: u3.output_tokens || 0,
+        total: (u3.input_tokens || 0) + (u3.output_tokens || 0)
+      } : null;
+      return { text, usage };
     }
 
     throw new Error("지원하지 않는 AI 제공사입니다: " + provider);
   }
 
   async function testPreset(preset) {
-    const text = await callAI(preset, "짧게 한 단어로만 답하라.", "테스트: '정상'이라고만 답해줘.");
-    return normalizeSpace(text).slice(0, 30);
+    const res = await callAI(preset, "짧게 한 단어로만 답하라.", "테스트: '정상'이라고만 답해줘.");
+    return normalizeSpace(res.text).slice(0, 30);
   }
 
   // ==========================================================
@@ -758,7 +809,25 @@
 
     try {
       const { system, user } = buildCorrectionPrompt(note, userText, envelopeText);
-      const raw = await callAI(preset, system, user);
+      const aiRes = await callAI(preset, system, user);
+      const raw = aiRes && aiRes.text;
+      const usage = aiRes && aiRes.usage;
+
+      if (usage) {
+        const stats = recordTokenUsage(roomId, usage);
+        if (debug) {
+          toast(
+            `🔢 이번 호출 토큰: 입력 ${usage.input} + 출력 ${usage.output} = ${usage.total} ` +
+            `(이 방 누적 ${stats.room ? stats.room.total : "?"}, 전체 누적 ${stats.global.total}, ${stats.global.calls}회 호출)`,
+            false
+          );
+        }
+        console.log("📝 UserNoteCorrector 토큰 사용:", usage, "누적:", stats);
+        refreshTokenUI();
+      } else if (debug) {
+        toast("ℹ 이 API는 응답에 토큰 사용량을 안 줘서 집계 불가", false);
+      }
+
       const parsed = parseModelJson(raw);
       if (!parsed || !Array.isArray(parsed.conflicts)) {
         if (debug) toast("⚠ AI 응답을 JSON으로 못 읽음. 원문 앞부분: " + String(raw || "").slice(0, 150), true);
@@ -1231,6 +1300,13 @@
       <button id="testPreset">연결 테스트</button>
     </div>
     <div class="status" id="apiStatus">아직 테스트 안 함</div>
+
+    <hr>
+    <label style="margin-top:0;">토큰 사용량 (제타 토큰 아님, 이 API 호출분)</label>
+    <div class="status" id="tokenStatus">집계 없음</div>
+    <div class="row">
+      <button id="resetTokens">이 방 토큰 집계 초기화</button>
+    </div>
   </div>
 
   <hr>
@@ -1254,6 +1330,7 @@
   const baseUrlWrapEl = el("baseUrlWrap");
   const baseUrlEl = el("baseUrl");
   const apiStatusEl = el("apiStatus");
+  const tokenStatusEl = el("tokenStatus");
 
   const BTN_SIZE = 32, BTN_MARGIN = 4;
 
@@ -1295,13 +1372,35 @@
   // ---- 노트 탭 ----
   function updateCount() { countEl.textContent = noteEl.value.length.toLocaleString() + "자"; }
 
+  function refreshTokenUI() {
+    const room = roomId ? getTokenStats(LS_TOKEN_PREFIX + roomId) : null;
+    const global = getTokenStats(LS_TOKEN_GLOBAL_KEY);
+    if (!room && !global.calls) {
+      tokenStatusEl.className = "status";
+      tokenStatusEl.textContent = "집계 없음 (아직 호출 안 됨)";
+      return;
+    }
+    tokenStatusEl.className = "status ok";
+    tokenStatusEl.textContent =
+      `이 방: 입력 ${room ? room.input : 0} + 출력 ${room ? room.output : 0} = ${room ? room.total : 0} (${room ? room.calls : 0}회)\n` +
+      `전체: 입력 ${global.input} + 출력 ${global.output} = ${global.total} (${global.calls}회)`;
+  }
+
   function refreshRoomUI() {
     roomEl.textContent = "Room: " + (roomId ? roomId.slice(0, 24) : "(감지 안 됨)");
     noteEl.value = getNote(roomId);
     enabledEl.checked = getEnabled(roomId);
     updateCount();
     refreshPresetUI();
+    refreshTokenUI();
   }
+
+  el("resetTokens").addEventListener("click", () => {
+    if (!confirm("이 방의 토큰 집계만 초기화할까요? (전체 누적은 유지됩니다)")) return;
+    localStorage.removeItem(LS_TOKEN_PREFIX + roomId);
+    refreshTokenUI();
+    flashSaved("이 방 토큰 집계 초기화됨");
+  });
 
   noteEl.addEventListener("input", () => { updateCount(); });
   el("saveNote").addEventListener("click", () => {
