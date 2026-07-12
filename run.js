@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.3.0
+// @version      1.4.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.3.0";
+  const VERSION = "1.4.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -105,7 +105,35 @@
       .sort((a, b) => b.length - a.length)[0] || "";
   }
 
-  // 제타 스트리밍 응답 전체(SSE)에서: 완성된 답변 텍스트 + messageId + candidateId를 뽑아낸다.
+  // 답변의 contents 배열(TEXT + INFO_BOX)을 사람이 읽고 AI가 대조할 수 있는 텍스트로 직렬화한다.
+  // TEXT는 원문 그대로, INFO_BOX는 라벨:값 형태로 풀어서 붙인다.
+  // 여기서 값(value)들은 원본 JSON 문자열 그대로 유지되므로, 나중에 find/replace로
+  // 원본 스트림 텍스트 안에서 그대로 찾아낼 수 있다.
+  function serializeContents(contents) {
+    if (!Array.isArray(contents)) return "";
+    const parts = [];
+    contents.forEach((c) => {
+      if (!c) return;
+      if (c.type === "TEXT" && typeof c.text === "string") {
+        parts.push(c.text);
+      } else if (c.type === "INFO_BOX") {
+        const sceneLines = (c.scenes || [])
+          .map((s) => (s && typeof s.value === "string") ? `${s.label || ""}: ${s.value}`.trim() : "")
+          .filter(Boolean);
+        if (sceneLines.length) parts.push("[상태창]\n" + sceneLines.join("\n"));
+        (c.characters || []).forEach((ch) => {
+          const itemLines = (ch && ch.items || [])
+            .map((it) => (it && typeof it.value === "string") ? `${it.label || ""}: ${it.value}`.trim() : "")
+            .filter(Boolean);
+          if (itemLines.length) parts.push(`[${(ch && ch.name) || "캐릭터"}]\n` + itemLines.join("\n"));
+        });
+      }
+    });
+    return parts.filter(Boolean).join("\n\n").trim();
+  }
+
+  // 제타 스트리밍 응답 전체(SSE)에서: 완성된 답변 텍스트(TEXT+INFO_BOX 포함) + messageId + candidateId를 뽑아낸다.
+  // 새 메시지 전송(CHAT_COMPLETE)과 리롤/다시받기(CANDIDATE_COMPLETE) 둘 다 명시적으로 처리한다.
   function extractReplyEnvelope(responseText) {
     const events = parseSse(responseText);
     const trueDeltas = [];
@@ -116,15 +144,24 @@
     let completeText = "";
 
     events.forEach((event) => {
-      if (event && typeof event === "object" && String(event.event || "").toUpperCase() === "CHAT_COMPLETE" && event.replyMessage) {
+      if (!event || typeof event !== "object") return;
+      const evType = String(event.event || "").toUpperCase();
+
+      if (evType === "CHAT_COMPLETE" && event.replyMessage) {
         const reply = event.replyMessage;
         if (reply.id) ids.messageId = String(reply.id);
         if (reply.candidateId) ids.candidateId = String(reply.candidateId);
         if (event.requestId) ids.requestId = String(event.requestId);
-        if (Array.isArray(reply.contents)) {
-          completeText = reply.contents.map((c) => String((c && c.text) || "")).filter(Boolean).join("\n").trim();
-        }
+        if (Array.isArray(reply.contents)) completeText = serializeContents(reply.contents);
       }
+
+      // 리롤("다시 받기") 응답은 CHAT_COMPLETE가 아니라 CANDIDATE_COMPLETE로 온다.
+      if (evType === "CANDIDATE_COMPLETE" && event.candidate) {
+        const cand = event.candidate;
+        if (cand.id) ids.candidateId = String(cand.id);
+        if (Array.isArray(cand.contents)) completeText = serializeContents(cand.contents);
+      }
+
       walk(event, "", (value, path) => {
         const lower = path.toLowerCase();
         const key = lower.split(".").pop().replace(/\[\d+\]$/, "");
@@ -168,12 +205,12 @@
       const target = new URL(String(url || ""), location.href);
       return target.hostname === "api.zeta-ai.io" &&
         String(method || "").toUpperCase() === "POST" &&
-        /^\/v1\/rooms\/[^/]+\/messages\/stream\/?$/i.test(target.pathname);
+        /^\/v1\/rooms\/[^/]+\/messages\/(?:stream|[^/]+\/candidates\/stream)\/?$/i.test(target.pathname);
     } catch { return false; }
   }
 
   function roomIdFromUrl(url) {
-    const m = String(url || "").match(/\/v1\/rooms\/([^/]+)\/messages\/stream/i);
+    const m = String(url || "").match(/\/v1\/rooms\/([^/]+)\/messages\//i);
     if (m) return decodeURIComponent(m[1]);
     return currentRoomId();
   }
@@ -383,15 +420,18 @@
   function buildCorrectionPrompt(note, userText, originalReply) {
     const system = [
       "당신은 대화 로그 검수자다. 아래 [유저노트]에 적힌 확정 사실·현재 상태와, [제타 원본 답변]을 대조한다.",
+      "[제타 원본 답변]에는 대사/지문(TEXT) 외에 [상태창], [캐릭터명] 같은 대괄호 섹션이 있을 수 있는데,",
+      "이건 그 답변에 같이 딸려온 상태창(날짜/장소/속마음 등) 정보를 라벨: 값 형태로 풀어놓은 것이다. 이 값들도 검수 대상이다.",
       "임무는 명백히 모순되는 부분만 찾아서 고치는 것이지, 전체를 다시 쓰는 것이 아니다.",
       "",
       "규칙:",
-      "1. 원본 답변에 유저노트와 실제로 모순되는 문장/구절이 있을 때만 손댄다.",
+      "1. 원본 답변에 유저노트와 실제로 모순되는 문장/구절/상태값이 있을 때만 손댄다.",
       "2. 유저노트가 다루지 않거나, 원본이 그 화제를 그냥 언급하지 않고 넘어가는 경우는 모순이 아니다. 아무것도 추가하지 않는다.",
-      "3. 문체, 어투, 인칭, 문단 구성, 대사와 지문 배치, 상태창 등 형식은 절대 건드리지 않는다.",
+      "3. 문체, 어투, 인칭, 문단 구성, 대사와 지문 배치, 상태창 라벨/형식은 절대 건드리지 않는다.",
       "4. find는 [제타 원본 답변]에 있는 문자열을 한 글자도 틀리지 않고 그대로 옮겨 적어야 한다 (요약·의역 금지).",
+      "   상태창 값을 고칠 때도 'label: ' 부분은 빼고 값(value) 부분만 find로 잡는다.",
       "5. find는 원본 안에서 유일하게 특정되어야 한다. 같은 문구가 반복되는 곳이면 앞뒤 맥락을 포함해 더 길게 잡는다.",
-      "6. replace는 모순만 해소하도록 최소한으로 고친 문장이며, 원본의 문체와 어울려야 한다.",
+      "6. replace는 모순만 해소하도록 최소한으로 고친 문장/값이며, 원본의 문체와 어울려야 한다.",
       "7. 모순이 없으면 conflicts를 빈 배열로 반환한다.",
       "8. 반드시 아래 JSON 형식 하나만 반환한다. 다른 설명이나 사과를 덧붙이지 않는다.",
       "",
