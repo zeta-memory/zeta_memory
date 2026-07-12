@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      1.1.0
+// @version      1.2.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "1.1.0";
+  const VERSION = "1.2.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -387,11 +387,6 @@
   // ==========================================================
   // 3.5 네트워크 응답(SSE 원본 텍스트) 단계에서 직접 패치
   // ==========================================================
-  // 화면에 이미 그려진 DOM을 나중에 찾아 바꾸는 방식은 Shadow DOM 등으로 인해
-  // 실패할 수 있다. 그래서 제타 서버가 보낸 SSE 응답 문자열 자체에서, AI가 만든
-  // "완성된 답변 텍스트"가 들어있는 JSON 블록을 찾아 그 안의 문자열 필드를
-  // 직접 고친 뒤, 그 수정된 응답을 화면에 넘겨준다. 이러면 제타 앱은 원래부터
-  // 그렇게 답장이 온 것처럼 자기 방식대로 정상적으로 렌더링하게 된다.
 
   function walkMutableStrings(value, visit) {
     if (value == null || typeof value !== "object") return;
@@ -425,8 +420,6 @@
     const targetNorm = normalizeSpace(original);
     if (!targetNorm) return undefined;
     if (strNorm === targetNorm) return revised;
-    // 원본이 이 문자열 안에 "실질적으로" 포함되어 있을 만큼 충분히 긴 경우에만
-    // 공백-무시 정규식 폴백을 시도한다 (짧은 필드에 우연히 걸리는 것을 방지).
     if (strNorm.includes(targetNorm) && str.length >= original.length * 0.5) {
       const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
       let re = null;
@@ -488,8 +481,11 @@
   }
 
   // ==========================================================
-  // 4. 화면에 보이는 답변 교체 (텍스트만 치환, DOM 구조는 안 건드림) — XHR 경로용 폴백
+  // 4. 화면에 보이는 답변 교체 (텍스트만 치환, DOM 구조는 안 건드림) — 최후의 폴백
   // ==========================================================
+  // v1.2.0부터는 XHR 스트림 경로도 fetch처럼 네트워크 응답 자체를 패치하므로
+  // 이 함수는 "노트/프리셋이 꺼져있던 방을 나중에 켠 경우" 등 아주 드문 예외
+  // 상황에서만 호출되는 보조 수단이다.
 
   function patchVisibleReply(original, revised, messageId, candidateId) {
     const targetNorm = normalizeSpace(original);
@@ -501,16 +497,6 @@
       return String(value || "").replace(/["\\]/g, "\\$&");
     }
 
-    // 이전 버전에는 "자식 엘리먼트가 없는 leaf 노드만" 후보로 삼는 조건이 있었는데,
-    // 지문(이탤릭)과 대사가 여러 자식 태그로 나뉘어 있는 답변에서는 그 조건 때문에
-    // 텍스트 전체를 담은 요소도, 텍스트 일부만 담은 leaf 요소도 둘 다 targetNorm과
-    // 정확히 일치하지 않아 아무것도 못 찾는 문제가 있었다. 그래서 "자식이 있어도 되고,
-    // 대신 textContent가 정확히 일치하는 요소들 중 가장 좁게 감싸는 요소"를 고르는
-    // 방식으로 바꿨다.
-    // zeta 앱이 메시지 말풍선을 Shadow DOM(웹 컴포넌트)으로 렌더링하는 경우,
-    // 일반 document.querySelectorAll은 그 내부를 못 뚫고 들어간다. 그래서
-    // 페이지 전체에서 open shadow root를 재귀적으로 찾아 검색 범위에 포함시킨다.
-    // (closed shadow root는 원리상 외부 스크립트가 접근할 수 없다.)
     function collectShadowRoots() {
       const roots = [document];
       const seen = new Set();
@@ -552,19 +538,13 @@
     }
 
     function pickTightestMatch(pool) {
-      // 1순위: textContent가 답변 원문과 "정확히" 같은 요소 (가장 안전, 오탐 위험 없음)
       let matches = pool.filter((el) => normalizeSpace(el.textContent || "") === targetNorm);
       if (!matches.length) {
-        // 2순위: 정확히 같은 요소가 없다면, 라벨("zeta" 표시, 타임스탬프 등)이 같은
-        // 컨테이너 안에 섞여 들어가 있는 경우가 있다. 이때는 "답변 원문 전체를
-        // 포함하고 있는" 요소들 중 가장 짧은(=가장 좁게 감싸는) 요소를 고른다.
         matches = pool.filter((el) => normalizeSpace(el.textContent || "").includes(targetNorm));
         if (!matches.length) return null;
         matches.sort((a, b) => normalizeSpace(a.textContent || "").length - normalizeSpace(b.textContent || "").length);
         return matches[0];
       }
-      // 자손 엘리먼트 수가 가장 적은(=텍스트를 가장 좁게 감싸는) 요소를 고른다.
-      // 여러 메시지를 통째로 감싼 큰 컨테이너가 잘못 선택되는 것을 막는다.
       matches.sort((a, b) => a.querySelectorAll("*").length - b.querySelectorAll("*").length);
       return matches[0];
     }
@@ -594,17 +574,12 @@
       return pickTightestMatch(candidateElements(broad.slice(-500)));
     }
 
-    // 찾은 요소의 실제(raw) 텍스트 안에서 가능한 한 "원본 문자열 부분만" 바꾸고
-    // 나머지(라벨, 타임스탬프 등)는 그대로 남긴다. 라벨이 섞여 있지 않고 요소
-    // 전체가 답변 텍스트뿐이라면 결과적으로 전체 치환과 동일하다.
     function applyToElement(elm) {
       const full = elm.textContent || "";
       if (full.includes(original)) {
         elm.textContent = full.replace(original, revised);
         return true;
       }
-      // 공백/줄바꿈 방식이 미묘하게 달라 원본 그대로는 못 찾을 때를 위한
-      // 공백-무시 정규식 폴백. 그래도 못 찾으면 안전하게 전체를 덮어쓴다.
       const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
       let re = null;
       try { re = new RegExp(escaped); } catch { re = null; }
@@ -628,7 +603,6 @@
     }
     const ok = applyToElement(el);
     if (!ok) return false;
-    // 일부 프레임워크(React 등)가 다음 렌더에서 원문으로 되돌리는 경우가 있어 한 번 더 확인.
     setTimeout(() => {
       const again = findTarget();
       if (again && (again.textContent || "").includes(original)) applyToElement(again);
@@ -652,7 +626,6 @@
   }
 
   async function computeCorrection(roomId, userText, envelopeText) {
-    // 반환: { skip: true, reason } 또는 { skip: false, result, applied, skipped }
     const debug = getDebug(roomId);
 
     const note = normalizeSpace(getNote(roomId));
@@ -686,7 +659,7 @@
     }
   }
 
-  // ---- XHR 경로용 폴백 : 이미 화면에 그려진 뒤 DOM을 찾아 고친다 (Shadow DOM이면 실패할 수 있음) ----
+  // ---- 최후의 폴백 : 이미 화면에 그려진 뒤 DOM을 찾아 고친다 (Shadow DOM이면 실패할 수 있음) ----
   async function handleCompletedReplyLegacyDom(url, userText, responseText) {
     const roomId = roomIdFromUrl(url);
     if (!roomId) return;
@@ -718,8 +691,6 @@
   }
 
   // ---- fetch 후킹 : 응답 전체를 버퍼링해서 AI 대조 → 네트워크 응답 자체를 고쳐서 반환 ----
-  // (Shadow DOM 등 화면 접근 문제와 무관하게 100% 적용되지만, 노트가 있는 방은
-  //  실시간 타이핑 애니메이션 없이 대조가 끝난 뒤 완성된 형태로 표시된다.)
 
   const originalFetch = window.fetch.bind(window);
 
@@ -752,7 +723,6 @@
     const roomId = roomIdFromUrl(url);
     const debug = roomId ? getDebug(roomId) : false;
     if (!roomId || !getEnabled(roomId) || !normalizeSpace(getNote(roomId)) || !getActivePreset(roomId)) {
-      // 노트/프리셋이 없거나 꺼져있으면 손대지 않고 그대로 통과시켜 실시간 스트리밍을 유지한다.
       return response;
     }
 
@@ -790,28 +760,164 @@
     }
   };
 
+  // ---- XHR 후킹 : 노트+프리셋이 켜진 방이면, 실제 XHR 대신 fetch로 요청을 대신 보내고
+  //      완성/교정된 응답을 XHR인 척 흉내내어(readyState/status/responseText 등) 돌려준다.
+  //      노트가 꺼진 방은 원래 XHR을 그대로 써서 실시간 스트리밍을 그대로 유지한다.
+
+  function dispatchXhrLifecycle(xhr, opts) {
+    function fire(type, init) {
+      let ev;
+      try { ev = new ProgressEvent(type, init || {}); }
+      catch { ev = new Event(type); }
+      try { xhr.dispatchEvent(ev); } catch {}
+      const handlerName = "on" + type;
+      if (typeof xhr[handlerName] === "function") {
+        try { xhr[handlerName](ev); } catch {}
+      }
+    }
+
+    function defineProp(name, value) {
+      try { Object.defineProperty(xhr, name, { value, configurable: true }); } catch {}
+    }
+
+    if (opts.networkError) {
+      defineProp("readyState", 4);
+      defineProp("status", 0);
+      defineProp("statusText", "");
+      fire("readystatechange");
+      fire("error");
+      fire("loadend");
+      return;
+    }
+
+    const bodyText = opts.bodyText || "";
+    let headerText = "";
+    try {
+      if (opts.headers && typeof opts.headers.forEach === "function") {
+        opts.headers.forEach((v, k) => { headerText += k + ": " + v + "\r\n"; });
+      }
+    } catch {}
+
+    defineProp("readyState", 4);
+    defineProp("status", opts.status || 200);
+    defineProp("statusText", opts.statusText || "");
+    defineProp("responseURL", opts.responseURL || "");
+    defineProp("responseText", bodyText);
+    defineProp("response", bodyText);
+    xhr.getAllResponseHeaders = () => headerText;
+    xhr.getResponseHeader = (name) => {
+      try { return opts.headers ? opts.headers.get(name) : null; } catch { return null; }
+    };
+
+    fire("readystatechange");
+    fire("progress", { lengthComputable: true, loaded: bodyText.length, total: bodyText.length });
+    fire("load", { lengthComputable: true, loaded: bodyText.length, total: bodyText.length });
+    fire("loadend", { lengthComputable: true, loaded: bodyText.length, total: bodyText.length });
+  }
+
   const OrigXHR = window.XMLHttpRequest;
   const origOpen = OrigXHR.prototype.open;
   const origSend = OrigXHR.prototype.send;
+  const origSetRequestHeader = OrigXHR.prototype.setRequestHeader;
 
   OrigXHR.prototype.open = function (method, url, ...rest) {
     this.__uncMethod = String(method || "GET").toUpperCase();
     this.__uncUrl = url;
+    this.__uncHeaders = {};
     return origOpen.call(this, method, url, ...rest);
   };
 
+  OrigXHR.prototype.setRequestHeader = function (name, value) {
+    if (this.__uncHeaders) this.__uncHeaders[name] = value;
+    return origSetRequestHeader.call(this, name, value);
+  };
+
   OrigXHR.prototype.send = function (body) {
-    if (isStreamEndpoint(this.__uncUrl, this.__uncMethod)) {
+    const isStream = isStreamEndpoint(this.__uncUrl, this.__uncMethod);
+    if (!isStream) return origSend.call(this, body);
+
+    const url = this.__uncUrl;
+    const roomId = roomIdFromUrl(url);
+    const active = !!(roomId && getEnabled(roomId) && normalizeSpace(getNote(roomId)) && getActivePreset(roomId));
+
+    if (!active) {
+      // 노트/프리셋 없음 → 원래 XHR 그대로 보내서 실시간 스트리밍 유지.
+      // 완료 후에는 (혹시 몰라) 레거시 DOM 패치를 한 번 시도해본다.
       const userText = userTextFromRequestBody(requestBodyText(body));
-      this.addEventListener("loadend", function (event) {
+      const boundUrl = url;
+      this.addEventListener("loadend", (event) => {
         const req = event.currentTarget;
         if (!req || req.status < 200 || req.status >= 300) return;
         let text = "";
         try { text = String(req.responseText || ""); } catch {}
-        handleCompletedReplyLegacyDom(this.__uncUrl, userText, text);
+        handleCompletedReplyLegacyDom(boundUrl, userText, text);
       });
+      return origSend.call(this, body);
     }
-    return origSend.call(this, body);
+
+    // 노트+프리셋 활성 → 진짜 XHR을 보내지 않고, 대신 fetch로 같은 요청을 보내서
+    // 완성된 응답을 받은 뒤 교정하고, 그 결과를 XHR 응답인 것처럼 흉내내어 돌려준다.
+    const xhrInstance = this;
+    const debug = getDebug(roomId);
+    const userText = userTextFromRequestBody(requestBodyText(body));
+    const headers = xhrInstance.__uncHeaders || {};
+    const withCreds = !!xhrInstance.withCredentials;
+
+    (async () => {
+      let response;
+      try {
+        response = await originalFetch(url, {
+          method: xhrInstance.__uncMethod || "POST",
+          headers,
+          body,
+          credentials: withCreds ? "include" : "same-origin"
+        });
+      } catch (err) {
+        if (debug) toast("❌ XHR 대체 요청 실패: " + (err && err.message || err), true);
+        dispatchXhrLifecycle(xhrInstance, { networkError: true });
+        return;
+      }
+
+      let rawText = "";
+      try { rawText = await response.text(); } catch {}
+
+      let finalText = rawText;
+      try {
+        const envelope = extractReplyEnvelope(rawText);
+        if (envelope.text) {
+          const key = [roomId, envelope.messageId, envelope.candidateId, envelope.text.slice(0, 60)].join("|");
+          if (!processedKeys.has(key)) {
+            processedKeys.add(key);
+            if (processedKeys.size > 300) {
+              const it = processedKeys.values();
+              for (let i = 0; i < 100; i++) processedKeys.delete(it.next().value);
+            }
+            const outcome = await computeCorrection(roomId, userText, envelope.text);
+            if (!outcome.skip) {
+              const patched = patchRawSseText(rawText, envelope.text, outcome.result);
+              if (patched.changed) {
+                finalText = patched.text;
+                toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
+              } else if (debug) {
+                toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
+              }
+            }
+          }
+        } else if (debug) {
+          toast("⚠ 응답에서 답변 텍스트를 못 뽑음", true);
+        }
+      } catch (err) {
+        if (debug) toast("❌ XHR 교정 중 오류: " + (err && err.message || err), true);
+      }
+
+      dispatchXhrLifecycle(xhrInstance, {
+        status: response.status,
+        statusText: response.statusText,
+        responseURL: response.url || url,
+        headers: response.headers,
+        bodyText: finalText
+      });
+    })();
   };
 
   // ==========================================================
