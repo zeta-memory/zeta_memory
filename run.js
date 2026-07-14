@@ -595,6 +595,40 @@
     return Array.from(map, ([find, replace]) => ({ find, replace }));
   }
 
+  // ---- 이미 적용했던 "전체 재작성" 결과를 messageId/candidateId 기준으로 기억 ----
+  // find/replace로는 표현이 안 되는 전체 교체라서, 나중에 대화 이력이 다른 API로 다시
+  // 조회될 때 원본으로 되돌아가는 걸 막으려면 이 id 기준 기억이 따로 필요하다.
+  const LS_REWRITE_APPLIED_PREFIX = "zeta-unc-rewrite-applied-";
+
+  function recordAppliedRewrite(roomId, entry) {
+    if (!roomId || !entry || !entry.newContents || (!entry.messageId && !entry.candidateId)) return;
+    const key = LS_REWRITE_APPLIED_PREFIX + roomId;
+    const list = safeJsonParse(localStorage.getItem(key), []) || [];
+    const idx = list.findIndex((x) => (entry.messageId && x.messageId === entry.messageId) || (entry.candidateId && x.candidateId === entry.candidateId));
+    const item = { messageId: entry.messageId || "", candidateId: entry.candidateId || "", newContents: entry.newContents, ts: Date.now() };
+    if (idx !== -1) list[idx] = item; else list.push(item);
+    while (list.length > 100) list.shift();
+    try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
+  }
+
+  // 모든 방에서 지금까지 적용된 전체 재작성 결과를 모아온다 (messageId/candidateId 기준 중복 제거).
+  function getAllAppliedRewrites() {
+    const map = new Map();
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || k.indexOf(LS_REWRITE_APPLIED_PREFIX) !== 0) continue;
+        const list = safeJsonParse(localStorage.getItem(k), []) || [];
+        list.forEach((c) => {
+          if (!c || !c.newContents) return;
+          const key = c.messageId || c.candidateId;
+          if (key) map.set(key, c);
+        });
+      }
+    } catch {}
+    return Array.from(map.values());
+  }
+
   // ---- 유저노트 대조용 AI 호출이 실제로 소비한 토큰(제타 토큰 아님, 연결한 API 쪽) 누적 집계 ----
   const LS_TOKEN_PREFIX = "zeta-unc-tokens-";
   const LS_TOKEN_GLOBAL_KEY = "zeta-unc-tokens-global";
@@ -1337,6 +1371,32 @@
     return { text, changed: changedAny };
   }
 
+  // 스트림 응답이 아닌 "일반 JSON" 응답(예: 대화 이력 재조회 등)에서, 예전에 적용했던
+  // "전체 재작성" 결과를 messageId/candidateId로 찾아서 contents 배열째로 다시 바꿔치기한다.
+  // find/replace 문자열 치환으로는 표현이 안 되는 종류의 패치라서 별도로 필요하다.
+  function patchGenericJsonContentsById(rawText, rewrites) {
+    if (!Array.isArray(rewrites) || !rewrites.length) return { text: rawText, changed: false };
+    const whole = safeJsonParse(rawText, null);
+    if (whole === null || typeof whole !== "object") return { text: rawText, changed: false };
+
+    let changed = false;
+    walk(whole, "", (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      if (!Array.isArray(value.contents)) return;
+      const idStr = value.id != null ? String(value.id) : "";
+      const candIdStr = value.candidateId != null ? String(value.candidateId) : "";
+      const match = rewrites.find((r) =>
+        (r.messageId && (r.messageId === idStr || r.messageId === candIdStr)) ||
+        (r.candidateId && (r.candidateId === idStr || r.candidateId === candIdStr))
+      );
+      if (match) { value.contents = match.newContents; changed = true; }
+    });
+
+    if (!changed) return { text: rawText, changed: false };
+    try { return { text: JSON.stringify(whole), changed: true }; }
+    catch { return { text: rawText, changed: false }; }
+  }
+
   // ==========================================================
   // 4. 화면에 보이는 답변 교체 (텍스트만 치환, DOM 구조는 안 건드림) — 최후의 폴백
   // ==========================================================
@@ -1636,20 +1696,25 @@
 
     if (!isStream) {
       // 스트림 엔드포인트가 아닌 다른 zeta API 응답(예: 대화 이력 재조회)도,
-      // 예전에 적용했던 교정이 있다면 AI 호출 없이 그대로 재적용한다.
+      // 예전에 적용했던 교정/전체 재작성이 있다면 AI 호출 없이 그대로 재적용한다.
       // 이렇게 해야 스트리밍이 끝난 뒤 다른 API가 원본 텍스트로 화면을 덮어쓰는 것을 막을 수 있다.
       if (!isZetaApiHost(url)) return originalFetch(input, init);
       const corrections = getAllCorrections();
-      if (!corrections.length) return originalFetch(input, init);
+      const rewrites = getAllAppliedRewrites();
+      if (!corrections.length && !rewrites.length) return originalFetch(input, init);
 
       const response = await originalFetch(input, init);
       if (!response.ok) return response;
       let rawText;
       try { rawText = await response.text(); } catch { return response; }
       try {
-        const patched = patchGenericJsonText(rawText, corrections);
-        if (patched.changed) return passthroughResponse(response, patched.text);
-        return passthroughResponse(response, rawText);
+        let text = rawText;
+        let anyChanged = false;
+        const byId = patchGenericJsonContentsById(text, rewrites);
+        if (byId.changed) { text = byId.text; anyChanged = true; }
+        const patched = patchGenericJsonText(text, corrections);
+        if (patched.changed) { text = patched.text; anyChanged = true; }
+        return passthroughResponse(response, anyChanged ? text : rawText);
       } catch {
         return passthroughResponse(response, rawText);
       }
@@ -1698,6 +1763,7 @@
       if (outcome.newContents) {
         const structResult = patchStructuredContents(rawText, envelope, outcome.newContents);
         if (structResult.changed) {
+          recordAppliedRewrite(roomId, { messageId: envelope.messageId, candidateId: envelope.candidateId, newContents: outcome.newContents });
           if (debug) toast("✅ 전체 재작성 반영됨 (네트워크 응답에 반영)", false);
           return passthroughResponse(response, structResult.text);
         }
@@ -1797,11 +1863,12 @@
 
     if (!isStream) {
       // 스트림이 아닌 다른 zeta API 요청(예: 대화 이력 재조회)도, 예전에 적용했던
-      // 교정이 있으면 AI 호출 없이 그대로 재적용한다. 기록된 교정이 전혀 없으면
+      // 교정/전체 재작성이 있으면 AI 호출 없이 그대로 재적용한다. 기록된 게 전혀 없으면
       // 평범하게 원래 XHR 그대로 보내서(빠르고 안전) 아무것도 건드리지 않는다.
       if (!isZetaApiHost(this.__uncUrl)) return origSend.call(this, body);
       const corrections = getAllCorrections();
-      if (!corrections.length) return origSend.call(this, body);
+      const rewrites = getAllAppliedRewrites();
+      if (!corrections.length && !rewrites.length) return origSend.call(this, body);
 
       const xhrInstance = this;
       const gUrl = xhrInstance.__uncUrl;
@@ -1824,7 +1891,9 @@
         try { rawText = await response.text(); } catch {}
         let finalText = rawText;
         try {
-          const patched = patchGenericJsonText(rawText, corrections);
+          const byId = patchGenericJsonContentsById(finalText, rewrites);
+          if (byId.changed) finalText = byId.text;
+          const patched = patchGenericJsonText(finalText, corrections);
           if (patched.changed) finalText = patched.text;
         } catch {}
         dispatchXhrLifecycle(xhrInstance, {
@@ -1902,6 +1971,7 @@
                 const structResult = patchStructuredContents(rawText, envelope, outcome.newContents);
                 if (structResult.changed) {
                   finalText = structResult.text;
+                  recordAppliedRewrite(roomId, { messageId: envelope.messageId, candidateId: envelope.candidateId, newContents: outcome.newContents });
                   if (debug) toast("✅ 전체 재작성 반영됨 (XHR 응답에 반영)", false);
                 } else if (debug) {
                   toast("⚠ 재작성은 계산됐지만 응답 본문 안에서 해당 메시지를 못 찾아 패치 실패", true);
