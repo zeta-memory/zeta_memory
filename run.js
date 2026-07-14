@@ -516,15 +516,17 @@
   // ---- 이미 적용했던 교정 내용 기억 (스트림 이후 다른 API가 원본으로 덮어쓰는 것을 방지) ----
   const LS_CORR_PREFIX = "zeta-unc-corrections-";
 
-  function recordCorrections(roomId, applied) {
+  function recordCorrections(roomId, applied, timing) {
     if (!roomId || !Array.isArray(applied) || !applied.length) return;
     const key = LS_CORR_PREFIX + roomId;
     const list = safeJsonParse(localStorage.getItem(key), []) || [];
     applied.forEach((c) => {
       if (!c || typeof c.find !== "string" || typeof c.replace !== "string" || !c.find) return;
+      const entry = { find: c.find, replace: c.replace, ts: Date.now() };
+      if (timing) entry.timing = timing;
       const idx = list.findIndex((x) => x.find === c.find);
-      if (idx !== -1) list[idx] = { find: c.find, replace: c.replace, ts: Date.now() };
-      else list.push({ find: c.find, replace: c.replace, ts: Date.now() });
+      if (idx !== -1) list[idx] = entry;
+      else list.push(entry);
     });
     while (list.length > 300) list.shift();
     try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
@@ -556,7 +558,9 @@
     if (!roomId || !entry || !entry.original || !entry.rewritten) return;
     const key = LS_REWRITE_PREFIX + roomId;
     const list = safeJsonParse(localStorage.getItem(key), []) || [];
-    list.push({ original: entry.original, rewritten: entry.rewritten, ts: Date.now() });
+    const item = { original: entry.original, rewritten: entry.rewritten, ts: Date.now() };
+    if (entry.timing) item.timing = entry.timing;
+    list.push(item);
     while (list.length > 30) list.shift(); // 전체 텍스트라 용량이 크므로 최근 30건만 유지
     try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
   }
@@ -1156,7 +1160,11 @@
       if (debug) {
         console.log("📝 UserNoteCorrector 전체 재작성 결과:", { original: originalFormatted, rewritten, newContents });
         toast("🔧 전체 재작성됨\n\n[원본]\n" + originalFormatted.slice(0, 300) + "\n\n[재작성]\n" + rewritten.slice(0, 300), false);
-        recordRewriteHistory(roomId, { original: originalFormatted, rewritten });
+        recordRewriteHistory(roomId, {
+          original: originalFormatted,
+          rewritten,
+          timing: { ctxMs: Math.round(tCtx - t0), aiMs: Math.round(tAi - tCtx), totalMs: Math.round(tAi - t0) }
+        });
       }
 
       return { skip: false, newContents };
@@ -1560,7 +1568,8 @@
         console.log("📝 UserNoteCorrector 수정 상세:", applied);
         toast("🔧 " + applied.length + "곳 수정됨 (화자: " + (speakerNames && speakerNames.length ? speakerNames.join(",") : "?") + ")\n\n" + detail, false);
       }
-      return { skip: false, result, applied, skipped };
+      const timing = { ctxMs: Math.round(tCtx - t0), aiMs: Math.round(tAi - tCtx), totalMs: Math.round(tAi - t0) };
+      return { skip: false, result, applied, skipped, timing };
     } catch (err) {
       toast("❌ 유저노트 교정 실패: " + (err && err.message || err), true);
       return { skip: true };
@@ -1698,7 +1707,7 @@
 
       const patchResult = applyCorrectionsToRawText(rawText, outcome.applied);
       if (patchResult.changed) {
-        recordCorrections(roomId, outcome.applied);
+        recordCorrections(roomId, outcome.applied, outcome.timing);
         if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (네트워크 응답에 반영)", false);
         return passthroughResponse(response, patchResult.text);
       }
@@ -1901,7 +1910,7 @@
                 const patched = applyCorrectionsToRawText(rawText, outcome.applied);
                 if (patched.changed) {
                   finalText = patched.text;
-                  recordCorrections(roomId, outcome.applied);
+                  recordCorrections(roomId, outcome.applied, outcome.timing);
                   if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
                 } else if (debug) {
                   toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
@@ -2238,6 +2247,11 @@
 
   let histMode = "partial"; // "partial" | "rewrite"
 
+  function formatHistTiming(timing) {
+    if (!timing) return "";
+    return `⏱ 컨텍스트 ${timing.ctxMs}ms / AI 호출 ${timing.aiMs}ms / 총 ${timing.totalMs}ms`;
+  }
+
   function renderHistory() {
     const list = getCorrectionHistory(roomId);
     if (!list.length) {
@@ -2250,7 +2264,7 @@
       item.className = "hist-item";
       const time = document.createElement("div");
       time.className = "hist-time";
-      time.textContent = formatHistTime(c.ts);
+      time.textContent = formatHistTime(c.ts) + (c.timing ? "  ·  " + formatHistTiming(c.timing) : "");
       const find = document.createElement("div");
       find.className = "hist-find";
       find.textContent = c.find;
@@ -2288,7 +2302,7 @@
       item.className = "hist-item";
       const time = document.createElement("div");
       time.className = "hist-time";
-      time.textContent = formatHistTime(c.ts);
+      time.textContent = formatHistTime(c.ts) + (c.timing ? "  ·  " + formatHistTiming(c.timing) : "");
       const find = document.createElement("div");
       find.className = "hist-find";
       find.textContent = "[원본]\n" + c.original;
