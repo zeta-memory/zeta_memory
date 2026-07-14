@@ -549,6 +549,34 @@
     localStorage.removeItem(LS_CORR_PREFIX + roomId);
   }
 
+  // ---- 전체 재작성 모드의 원본/재작성 이력 (디버그 모드일 때만 쌓임 — 평소엔 저장 안 함) ----
+  const LS_REWRITE_PREFIX = "zeta-unc-rewrites-";
+
+  function recordRewriteHistory(roomId, entry) {
+    if (!roomId || !entry || !entry.original || !entry.rewritten) return;
+    const key = LS_REWRITE_PREFIX + roomId;
+    const list = safeJsonParse(localStorage.getItem(key), []) || [];
+    list.push({ original: entry.original, rewritten: entry.rewritten, ts: Date.now() });
+    while (list.length > 30) list.shift(); // 전체 텍스트라 용량이 크므로 최근 30건만 유지
+    try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
+  }
+  function getRewriteHistory(roomId) {
+    if (!roomId) return [];
+    const list = safeJsonParse(localStorage.getItem(LS_REWRITE_PREFIX + roomId), []) || [];
+    return list.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  }
+  function deleteRewriteEntry(roomId, ts) {
+    if (!roomId) return;
+    const key = LS_REWRITE_PREFIX + roomId;
+    const list = safeJsonParse(localStorage.getItem(key), []) || [];
+    const next = list.filter((x) => x.ts !== ts);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+  }
+  function clearRewriteHistory(roomId) {
+    if (!roomId) return;
+    localStorage.removeItem(LS_REWRITE_PREFIX + roomId);
+  }
+
   // 모든 방에서 지금까지 적용됐던 교정 내용을 전부 모아온다 (find 기준 중복 제거, 최신이 우선).
   function getAllCorrections() {
     const map = new Map();
@@ -739,13 +767,17 @@
   // 3. 프롬프트 구성 (find/replace conflict 방식)
   // ==========================================================
 
-  function buildCorrectionPrompt(note, userText, originalReply, speakerNames) {
+  function buildCorrectionPrompt(note, userText, originalReply, speakerNames, ctx) {
     const speakerLine = (Array.isArray(speakerNames) && speakerNames.length)
       ? speakerNames.join(", ")
       : "(알 수 없음)";
+    ctx = ctx || {};
 
     const system = [
       "당신은 대화 로그 검수자다. 아래 [유저노트]에 적힌 확정 사실·현재 상태와, [제타 원본 답변]을 대조한다.",
+      "[로어북], [캐릭터 상세], [{{user}} 상세]가 같이 주어지면, 그건 모순 판단을 돕는 참고 자료일 뿐이다.",
+      "이 참고 자료에만 있고 [유저노트]에는 없는 내용을 근거로 새로 문구를 만들어내지 않는다 — 여전히 [유저노트]와의",
+      "명백한 모순만 고친다. 참고 자료는 그 모순이 실제로 캐릭터/설정과 앞뒤가 맞는지 확인하는 용도로만 쓴다.",
       "[지금 답변하는 캐릭터]는 이번 답변에서 실제로 말하고 있는 인물이다.",
       "[제타 원본 답변]에는 대사/지문(TEXT) 외에 [상태창], [캐릭터명] 같은 대괄호 섹션이 있을 수 있는데,",
       "이건 그 답변에 같이 딸려온 상태창(날짜/장소/속마음 등) 정보를 라벨: 값 형태로 풀어놓은 것이다. 이 값들도 검수 대상이다.",
@@ -760,7 +792,8 @@
       "   상태창 값을 고칠 때도 'label: ' 부분은 빼고 값(value) 부분만 find로 잡는다.",
       "5. find가 원본 안에 여러 번 나올 수 있다. 그 경우 모든 위치에 같은 replace를 적용해도 뜻이 통하는 문구로 find를 잡는다.",
       "   (문맥에 따라 다르게 고쳐야 하는 상황이면, 그 문맥까지 포함해서 find를 더 길고 구체적으로 잡아 그 자리만 특정한다.)",
-      "6. replace는 모순만 해소하도록 최소한으로 고친 문장/값이며, 원본의 문체와 어울려야 한다.",
+      "6. replace는 모순만 해소하도록 최소한으로 고친 문장/값이며, 원본의 문체와 어울려야 한다. [로어북]/[캐릭터 상세]에",
+      "   적힌 말투·성격과도 어긋나지 않게 쓴다.",
       "7. 유저노트 문장에 '어제/오늘/방금/지금' 같은 시간 표현이 있으면, 그 문장이 뜻하는 현재 상태까지 추론해서 대조한다.",
       "   (예: 노트에 '어제 부산에 놀러갔다가 오늘 집에 옴'이라고 적혀있는데, 원본 답변이 화자가 여전히 부산에 있는 것처럼",
       "   서술하면 -- '지금은 집에 있어야 한다'는 함의와 모순되는 것으로 본다.) 단, 노트에 안 적힌 화제까지 추측해서",
@@ -798,6 +831,15 @@
     const user = [
       "[지금 답변하는 캐릭터]",
       speakerLine,
+      "",
+      "[로어북]",
+      ctx.lorebookText || "(없음)",
+      "",
+      "[캐릭터 상세]",
+      ctx.charDetailText || "(없음)",
+      "",
+      "[{{user}} 상세]",
+      ctx.personaText || "(없음)",
       "",
       "[유저노트]",
       note,
@@ -1100,6 +1142,7 @@
       if (debug) {
         console.log("📝 UserNoteCorrector 전체 재작성 결과:", { original: originalFormatted, rewritten, newContents });
         toast("🔧 전체 재작성됨\n\n[원본]\n" + originalFormatted.slice(0, 300) + "\n\n[재작성]\n" + rewritten.slice(0, 300), false);
+        recordRewriteHistory(roomId, { original: originalFormatted, rewritten });
       }
 
       return { skip: false, newContents };
@@ -1436,10 +1479,30 @@
     const preset = getActivePreset(roomId);
     if (!preset) { toast("❌ 사용할 API 프리셋이 없습니다.", true); return { skip: true }; }
 
+    // 부분 수정(find/replace) 모드도 전체 재작성 모드와 동일하게 로어북/캐릭터 상세/{{user}} 상세를 참고 자료로 같이 준다.
+    // 이 컨텍스트를 못 가져와도(토큰 미확보, 네트워크 실패 등) 기능이 죽지 않고 노트만으로 대조를 계속한다.
+    let ctx = {};
+    if (capturedAuth) {
+      try {
+        const roomCtx = await getRoomContext(roomId);
+        if (roomCtx) {
+          const personaText = await fetchPersonaText(roomId, roomCtx.plotId);
+          ctx = { lorebookText: roomCtx.lorebookText, charDetailText: roomCtx.charDetailText, personaText };
+          if (debug) toast(`🔗 컨텍스트 포함: 로어북 ${roomCtx.lorebookText.length}자 + 캐릭상세 ${roomCtx.charDetailText.length}자 + 유저상세 ${(personaText || "").length}자`, false);
+        } else if (debug) {
+          toast("⚠ plotId/캐릭터 상세를 못 가져와서 노트만으로 대조함", false);
+        }
+      } catch (err) {
+        if (debug) toast("⚠ 로어북/캐릭상세 로딩 실패, 노트만으로 대조함: " + (err && err.message || err), false);
+      }
+    } else if (debug) {
+      toast("⚠ 아직 인증 토큰을 못 잡아서 노트만으로 대조함", false);
+    }
+
     if (debug) toast("⏳ 답변 캡처됨 (" + envelopeText.length + "자) → AI에 대조 요청 중... (표시가 잠시 지연됩니다)", false);
 
     try {
-      const { system, user } = buildCorrectionPrompt(note, userText, envelopeText, speakerNames);
+      const { system, user } = buildCorrectionPrompt(note, userText, envelopeText, speakerNames, ctx);
       const aiRes = await callAI(preset, system, user);
       const raw = aiRes && aiRes.text;
       const usage = aiRes && aiRes.usage;
@@ -1960,11 +2023,16 @@
       <button id="histToggle">뭐가 바뀌었는지 보기</button>
     </div>
     <div id="histWrap" class="hidden">
+      <div class="tabs" style="margin-bottom:0;">
+        <div class="tab active" id="histTabPartial">부분 수정</div>
+        <div class="tab" id="histTabRewrite">전체 재작성</div>
+      </div>
       <div class="hist-toolbar">
-        <span>이 방에서 적용된 교정 (최신순)</span>
+        <span id="histLabel">이 방에서 적용된 부분 수정 (최신순)</span>
         <button class="danger" id="histClear" style="flex:none;padding:4px 8px;">전체 삭제</button>
       </div>
       <div class="hist-list" id="histList"></div>
+      <div class="hist-list" id="histListRewrite" style="display:none;"></div>
     </div>
     <div class="row check">
       <input type="checkbox" id="fullRewriteMode" style="width:auto;margin:0;">
@@ -2035,7 +2103,11 @@
   const histToggleRowEl = el("histToggleRow");
   const histToggleEl = el("histToggle");
   const histWrapEl = el("histWrap");
+  const histTabPartialEl = el("histTabPartial");
+  const histTabRewriteEl = el("histTabRewrite");
+  const histLabelEl = el("histLabel");
   const histListEl = el("histList");
+  const histListRewriteEl = el("histListRewrite");
   const histClearEl = el("histClear");
   const fullRewriteModeEl = el("fullRewriteMode");
   const rewriteContextStatusEl = el("rewriteContextStatus");
@@ -2145,10 +2217,12 @@
     } catch { return ""; }
   }
 
+  let histMode = "partial"; // "partial" | "rewrite"
+
   function renderHistory() {
     const list = getCorrectionHistory(roomId);
     if (!list.length) {
-      histListEl.innerHTML = '<div class="hist-empty">아직 이 방에서 적용된 교정이 없습니다.</div>';
+      histListEl.innerHTML = '<div class="hist-empty">아직 이 방에서 적용된 부분 수정이 없습니다.</div>';
       return;
     }
     histListEl.innerHTML = "";
@@ -2168,20 +2242,11 @@
       row.className = "row";
       const copyBtn = document.createElement("button");
       copyBtn.textContent = "복사";
-      copyBtn.addEventListener("click", () => {
-        const text = "[원본] " + c.find + "\n[교정] " + c.replace;
-        (navigator.clipboard && navigator.clipboard.writeText
-          ? navigator.clipboard.writeText(text)
-          : Promise.reject()
-        ).then(() => flashSaved("복사됨")).catch(() => toast("클립보드 복사 실패", true));
-      });
+      copyBtn.addEventListener("click", () => copyHistText("[원본] " + c.find + "\n[교정] " + c.replace));
       const delBtn = document.createElement("button");
       delBtn.className = "danger";
       delBtn.textContent = "삭제";
-      delBtn.addEventListener("click", () => {
-        deleteCorrectionEntry(roomId, c.find);
-        renderHistory();
-      });
+      delBtn.addEventListener("click", () => { deleteCorrectionEntry(roomId, c.find); renderHistory(); });
       row.appendChild(copyBtn);
       row.appendChild(delBtn);
       item.appendChild(time);
@@ -2192,23 +2257,83 @@
     });
   }
 
+  function renderRewriteHistory() {
+    const list = getRewriteHistory(roomId);
+    if (!list.length) {
+      histListRewriteEl.innerHTML = '<div class="hist-empty">아직 이 방에서 적용된 전체 재작성이 없습니다.<br>(재작성 이력은 디버그 모드가 켜져있을 때만 쌓입니다.)</div>';
+      return;
+    }
+    histListRewriteEl.innerHTML = "";
+    list.forEach((c) => {
+      const item = document.createElement("div");
+      item.className = "hist-item";
+      const time = document.createElement("div");
+      time.className = "hist-time";
+      time.textContent = formatHistTime(c.ts);
+      const find = document.createElement("div");
+      find.className = "hist-find";
+      find.textContent = "[원본]\n" + c.original;
+      const replace = document.createElement("div");
+      replace.className = "hist-replace";
+      replace.textContent = "[재작성]\n" + c.rewritten;
+      const row = document.createElement("div");
+      row.className = "row";
+      const copyBtn = document.createElement("button");
+      copyBtn.textContent = "복사";
+      copyBtn.addEventListener("click", () => copyHistText("[원본]\n" + c.original + "\n\n[재작성]\n" + c.rewritten));
+      const delBtn = document.createElement("button");
+      delBtn.className = "danger";
+      delBtn.textContent = "삭제";
+      delBtn.addEventListener("click", () => { deleteRewriteEntry(roomId, c.ts); renderRewriteHistory(); });
+      row.appendChild(copyBtn);
+      row.appendChild(delBtn);
+      item.appendChild(time);
+      item.appendChild(find);
+      item.appendChild(replace);
+      item.appendChild(row);
+      histListRewriteEl.appendChild(item);
+    });
+  }
+
+  function copyHistText(text) {
+    (navigator.clipboard && navigator.clipboard.writeText
+      ? navigator.clipboard.writeText(text)
+      : Promise.reject()
+    ).then(() => flashSaved("복사됨")).catch(() => toast("클립보드 복사 실패", true));
+  }
+
+  function setHistMode(mode) {
+    histMode = mode;
+    const isPartial = mode === "partial";
+    histTabPartialEl.classList.toggle("active", isPartial);
+    histTabRewriteEl.classList.toggle("active", !isPartial);
+    histListEl.style.display = isPartial ? "flex" : "none";
+    histListRewriteEl.style.display = isPartial ? "none" : "flex";
+    histLabelEl.textContent = isPartial ? "이 방에서 적용된 부분 수정 (최신순)" : "이 방에서 적용된 전체 재작성 (최신순)";
+    if (isPartial) renderHistory(); else renderRewriteHistory();
+  }
+
+  histTabPartialEl.addEventListener("click", () => setHistMode("partial"));
+  histTabRewriteEl.addEventListener("click", () => setHistMode("rewrite"));
+
   // 디버그(테스트) 모드일 때만 "이력 보기" 버튼을 노출한다. 평소엔 안 보이고, 꺼지면 패널도 같이 접는다.
   function refreshHistoryUI() {
     const debugOn = debugModeEl.checked;
     histToggleRowEl.style.display = debugOn ? "flex" : "none";
     if (!debugOn) histWrapEl.classList.add("hidden");
-    if (!histWrapEl.classList.contains("hidden")) renderHistory();
+    if (!histWrapEl.classList.contains("hidden")) setHistMode(histMode);
   }
 
   histToggleEl.addEventListener("click", () => {
     histWrapEl.classList.toggle("hidden");
-    if (!histWrapEl.classList.contains("hidden")) renderHistory();
+    if (!histWrapEl.classList.contains("hidden")) setHistMode(histMode);
   });
 
   histClearEl.addEventListener("click", () => {
-    if (!confirm("이 방의 교정 이력을 전부 삭제할까요?")) return;
-    clearCorrectionHistory(roomId);
-    renderHistory();
+    const label = histMode === "partial" ? "부분 수정" : "전체 재작성";
+    if (!confirm("이 방의 " + label + " 이력을 전부 삭제할까요?")) return;
+    if (histMode === "partial") { clearCorrectionHistory(roomId); renderHistory(); }
+    else { clearRewriteHistory(roomId); renderRewriteHistory(); }
     flashSaved("이력 삭제됨");
   });
 
