@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      2.0.0
+// @version      2.1.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "2.0.0";
+  const VERSION = "2.1.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -457,16 +457,18 @@
 
   // 이 방에 연결된 로어북들의 항목을 전부 모아 텍스트로 합친다.
   async function fetchLorebookText(lorebookIds) {
-    if (!Array.isArray(lorebookIds) || !lorebookIds.length) return "";
+    if (!Array.isArray(lorebookIds) || !lorebookIds.length) return { text: "", titles: [] };
     const results = await Promise.all(lorebookIds.map((id) => apiGet(LOREBOOK_URL(id))));
     const parts = [];
+    const titles = [];
     results.forEach((lb) => {
       if (!lb) return;
+      titles.push(lb.title || "(제목없음)");
       (lb.items || []).forEach((it) => {
         if (it && it.content) parts.push(`[${it.name || "?"}]\n` + it.content);
       });
     });
-    return parts.join("\n\n");
+    return { text: parts.join("\n\n"), titles };
   }
 
   // 지금 이 방에서 실제로 쓰이고 있는 {{user}} 페르소나 설명을 가져온다
@@ -797,6 +799,14 @@
   // ==========================================================
 
   const FULL_REWRITE_SYSTEM_PROMPT = [
+    "[최우선 지시] 아래에 문체/분량/형식을 다듬는 규칙들이 이어지는데, 그보다 먼저 확인할 것이 있다.",
+    "이번 입력에는 [유저노트]라는 확정된 사실/현재 상태 메모가 같이 주어진다. [검토 대상 답변]에 그 노트와",
+    "명백히 모순되는 문장(예: 노트엔 이미 아는 사실인데 처음 알려주듯 말함, 노트가 말한 사실과 반대로 말함,",
+    "노트에 없는 사람의 사적인 일을 엉뚱한 화자가 아는 것처럼 말함 등)이 있으면, 그 부분의 사실관계를 노트에",
+    "맞게 반드시 바로잡은 채로 재작성한다. 이건 아래 '사건 진행/의미를 원문과 동일하게 유지하라'는 규칙보다",
+    "우선한다 — 그 규칙은 '문체를 다듬으면서 원래 의도를 왜곡하지 마라'는 뜻이지, '사실 오류까지 그대로",
+    "베끼라'는 뜻이 아니다. 노트가 다루지 않는 화제는 그대로 두고 새로 추가하지 않는다.",
+    "",
     "수정 답변은 제타 수정창에 그대로 넣을 수 있는 본문만 작성한다.",
     "검토 설명, 수정 이유, 제목, 항목 구분, 해설은 출력하지 않는다.",
     "",
@@ -823,7 +833,7 @@
     "가능하면 1개 말풍선 안에 정리하고, 길어질 경우에만 감정 변화나 행동 전환 기준으로 2~3개 정도로 나눈다.",
     "짧은 나래이터 말풍선 `@:`는 가급적 캐릭터 말풍선 안의 지문으로 흡수한다.",
     "",
-    "사건 진행은 바꾸지 않는다.",
+    "사건 진행은 바꾸지 않는다 (단, 위 [최우선 지시]에 따른 사실관계 교정은 예외).",
     "행동 순서, 관계성, 감정 방향, 대사 의미는 원문과 동일하게 유지한다.",
     "새 사건을 만들거나 분위기를 순하게 바꾸지 않는다.",
     "",
@@ -946,14 +956,20 @@
   // {{user}} 상세(페르소나)는 자주 바뀔 수 있어 매번 새로 가져온다.
   const roomContextCache = {};
 
-  async function getRoomContext(roomId) {
-    if (roomContextCache[roomId]) return roomContextCache[roomId];
+  async function getRoomContext(roomId, forceRefresh) {
+    if (!forceRefresh && roomContextCache[roomId]) return roomContextCache[roomId];
     const plotId = await resolvePlotId(roomId);
     if (!plotId) return null;
     const charResult = await fetchCharDetailText(plotId);
     const lorebookIds = charResult && charResult.draft && charResult.draft.lorebookIds;
-    const lorebookText = await fetchLorebookText(lorebookIds);
-    const ctx = { plotId, charDetailText: (charResult && charResult.text) || "", lorebookText: lorebookText || "" };
+    const lb = await fetchLorebookText(lorebookIds);
+    const ctx = {
+      plotId,
+      charName: (charResult && charResult.draft && charResult.draft.name) || "",
+      charDetailText: (charResult && charResult.text) || "",
+      lorebookText: lb.text || "",
+      lorebookTitles: lb.titles || []
+    };
     roomContextCache[roomId] = ctx;
     return ctx;
   }
@@ -1911,6 +1927,10 @@
       <input type="checkbox" id="fullRewriteMode" style="width:auto;margin:0;">
       <label style="margin:0;">전체 재작성 모드 (실험적, 로어북/캐릭상세 포함)</label>
     </div>
+    <div class="status" id="rewriteContextStatus" style="display:none;">아직 안 불러옴</div>
+    <div class="row" id="rewriteContextRefreshRow" style="display:none;">
+      <button id="rewriteContextRefresh">로어북/캐릭상세 새로고침</button>
+    </div>
     <textarea id="note" placeholder="유저노트 글자수가 늘어나면 API 설정란의 토큰 사용량도 같이 늘어납니다.&#10;글자수/비용은 API 설정 탭에서 확인하며 조절하세요.&#10;&#10;출력 방식/규칙(예: 짧게 출력, 내레이션 금지 등)은 이 기능으로는 반영되지 않습니다."></textarea>
     <div class="count" id="count">0자</div>
     <div class="row">
@@ -1970,6 +1990,9 @@
   const enabledEl = el("enabled");
   const debugModeEl = el("debugMode");
   const fullRewriteModeEl = el("fullRewriteMode");
+  const rewriteContextStatusEl = el("rewriteContextStatus");
+  const rewriteContextRefreshRowEl = el("rewriteContextRefreshRow");
+  const rewriteContextRefreshBtn = el("rewriteContextRefresh");
   const presetSelectEl = el("presetSelect");
   const presetNameEl = el("presetName");
   const providerEl = el("provider");
@@ -2034,6 +2057,40 @@
       `전체: 입력 ${global.input} + 출력 ${global.output} = ${global.total} (${global.calls}회)`;
   }
 
+  function renderRewriteContextStatus(ctx) {
+    if (!ctx) {
+      rewriteContextStatusEl.className = "status bad";
+      rewriteContextStatusEl.textContent = "⚠ 아직 못 불러옴 (인증 토큰 없거나 plotId 못 잡음 — 사이트 한번 조작해보고 새로고침 눌러보세요)";
+      return;
+    }
+    rewriteContextStatusEl.className = "status ok";
+    const lbLine = ctx.lorebookTitles.length
+      ? `🔗 로어북 ${ctx.lorebookTitles.length}개: ${ctx.lorebookTitles.join(", ")} (${ctx.lorebookText.length}자)`
+      : "🔗 로어북 연결 없음";
+    rewriteContextStatusEl.textContent =
+      `✅ 캐릭터: ${ctx.charName || "?"} (상세 ${ctx.charDetailText.length}자)\n${lbLine}`;
+  }
+
+  async function refreshRewriteContextUI(forceRefresh) {
+    const show = fullRewriteModeEl.checked;
+    rewriteContextStatusEl.style.display = show ? "" : "none";
+    rewriteContextRefreshRowEl.style.display = show ? "" : "none";
+    if (!show) return;
+    if (!forceRefresh && roomContextCache[roomId]) {
+      renderRewriteContextStatus(roomContextCache[roomId]);
+      return;
+    }
+    rewriteContextStatusEl.className = "status";
+    rewriteContextStatusEl.textContent = "불러오는 중...";
+    const ctx = await getRoomContext(roomId, forceRefresh);
+    renderRewriteContextStatus(ctx);
+  }
+
+  rewriteContextRefreshBtn.addEventListener("click", () => {
+    delete roomContextCache[roomId];
+    refreshRewriteContextUI(true);
+  });
+
   function refreshRoomUI() {
     roomEl.textContent = "Room: " + (roomId ? roomId.slice(0, 24) : "(감지 안 됨)");
     noteEl.value = getNote(roomId);
@@ -2043,6 +2100,7 @@
     updateCount();
     refreshPresetUI();
     refreshTokenUI();
+    refreshRewriteContextUI(false);
   }
 
   el("resetTokens").addEventListener("click", () => {
@@ -2059,7 +2117,10 @@
   });
   enabledEl.addEventListener("change", () => setEnabled(roomId, enabledEl.checked));
   debugModeEl.addEventListener("change", () => setDebug(roomId, debugModeEl.checked));
-  fullRewriteModeEl.addEventListener("change", () => setFullRewriteMode(roomId, fullRewriteModeEl.checked));
+  fullRewriteModeEl.addEventListener("change", () => {
+    setFullRewriteMode(roomId, fullRewriteModeEl.checked);
+    refreshRewriteContextUI(false);
+  });
 
   // ---- API 탭 ----
   function refreshPresetUI() {
