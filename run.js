@@ -530,6 +530,25 @@
     try { localStorage.setItem(key, JSON.stringify(list)); } catch {}
   }
 
+  // 이 방에서 지금까지 적용된 교정 내역을 최신순으로 돌려준다 (테스트 중 "뭐가 바뀌었나" 확인용).
+  function getCorrectionHistory(roomId) {
+    if (!roomId) return [];
+    const list = safeJsonParse(localStorage.getItem(LS_CORR_PREFIX + roomId), []) || [];
+    return list.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  }
+  // 이력에서 항목 하나만 삭제 (실제 "적용된 교정 기억"에서도 같이 지운다 — 다시 덮어써도 되는 항목이라는 뜻).
+  function deleteCorrectionEntry(roomId, find) {
+    if (!roomId) return;
+    const key = LS_CORR_PREFIX + roomId;
+    const list = safeJsonParse(localStorage.getItem(key), []) || [];
+    const next = list.filter((x) => x.find !== find);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch {}
+  }
+  function clearCorrectionHistory(roomId) {
+    if (!roomId) return;
+    localStorage.removeItem(LS_CORR_PREFIX + roomId);
+  }
+
   // 모든 방에서 지금까지 적용됐던 교정 내용을 전부 모아온다 (find 기준 중복 제거, 최신이 우선).
   function getAllCorrections() {
     const map = new Map();
@@ -1901,6 +1920,20 @@
   .status.bad { border-color: #6b4a2f; color: #ffb347; }
   hr { border: none; border-top: 1px solid #333; margin: 10px 0; }
   #baseUrlWrap.hidden { display: none; }
+
+  #histWrap.hidden { display: none; }
+  .hist-toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+  .hist-toolbar span { font-size: 10px; color: #999; }
+  .hist-list { max-height: 32vh; overflow-y: auto; margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+  .hist-item { background: #0d0d10; border: 1px solid #333; border-radius: 8px; padding: 6px 8px; }
+  .hist-item .hist-time { font-size: 9px; color: #999; margin-bottom: 4px; }
+  .hist-item .hist-find { font-size: 11px; color: #ffb347; word-break: break-word; }
+  .hist-item .hist-find::before { content: "▲ "; }
+  .hist-item .hist-replace { font-size: 11px; color: #7CFC9C; word-break: break-word; margin-top: 2px; }
+  .hist-item .hist-replace::before { content: "▼ "; }
+  .hist-item .row { margin-top: 6px; }
+  .hist-item button { padding: 4px 6px; font-size: 10px; }
+  .hist-empty { font-size: 11px; color: #999; text-align: center; padding: 10px 0; }
 </style>
 
 <div id="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg><span class="dot"></span></div>
@@ -1922,6 +1955,16 @@
     <div class="row check">
       <input type="checkbox" id="debugMode" style="width:auto;margin:0;">
       <label style="margin:0;">디버그 로그 보기 (평소엔 꺼두세요)</label>
+    </div>
+    <div class="row" id="histToggleRow" style="display:none;">
+      <button id="histToggle">뭐가 바뀌었는지 보기</button>
+    </div>
+    <div id="histWrap" class="hidden">
+      <div class="hist-toolbar">
+        <span>이 방에서 적용된 교정 (최신순)</span>
+        <button class="danger" id="histClear" style="flex:none;padding:4px 8px;">전체 삭제</button>
+      </div>
+      <div class="hist-list" id="histList"></div>
     </div>
     <div class="row check">
       <input type="checkbox" id="fullRewriteMode" style="width:auto;margin:0;">
@@ -1989,6 +2032,11 @@
   const savedEl = el("saved");
   const enabledEl = el("enabled");
   const debugModeEl = el("debugMode");
+  const histToggleRowEl = el("histToggleRow");
+  const histToggleEl = el("histToggle");
+  const histWrapEl = el("histWrap");
+  const histListEl = el("histList");
+  const histClearEl = el("histClear");
   const fullRewriteModeEl = el("fullRewriteMode");
   const rewriteContextStatusEl = el("rewriteContextStatus");
   const rewriteContextRefreshRowEl = el("rewriteContextRefreshRow");
@@ -2091,6 +2139,79 @@
     refreshRewriteContextUI(true);
   });
 
+  function formatHistTime(ts) {
+    try {
+      return new Date(ts).toLocaleString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: true, month: "numeric", day: "numeric" });
+    } catch { return ""; }
+  }
+
+  function renderHistory() {
+    const list = getCorrectionHistory(roomId);
+    if (!list.length) {
+      histListEl.innerHTML = '<div class="hist-empty">아직 이 방에서 적용된 교정이 없습니다.</div>';
+      return;
+    }
+    histListEl.innerHTML = "";
+    list.forEach((c) => {
+      const item = document.createElement("div");
+      item.className = "hist-item";
+      const time = document.createElement("div");
+      time.className = "hist-time";
+      time.textContent = formatHistTime(c.ts);
+      const find = document.createElement("div");
+      find.className = "hist-find";
+      find.textContent = c.find;
+      const replace = document.createElement("div");
+      replace.className = "hist-replace";
+      replace.textContent = c.replace;
+      const row = document.createElement("div");
+      row.className = "row";
+      const copyBtn = document.createElement("button");
+      copyBtn.textContent = "복사";
+      copyBtn.addEventListener("click", () => {
+        const text = "[원본] " + c.find + "\n[교정] " + c.replace;
+        (navigator.clipboard && navigator.clipboard.writeText
+          ? navigator.clipboard.writeText(text)
+          : Promise.reject()
+        ).then(() => flashSaved("복사됨")).catch(() => toast("클립보드 복사 실패", true));
+      });
+      const delBtn = document.createElement("button");
+      delBtn.className = "danger";
+      delBtn.textContent = "삭제";
+      delBtn.addEventListener("click", () => {
+        deleteCorrectionEntry(roomId, c.find);
+        renderHistory();
+      });
+      row.appendChild(copyBtn);
+      row.appendChild(delBtn);
+      item.appendChild(time);
+      item.appendChild(find);
+      item.appendChild(replace);
+      item.appendChild(row);
+      histListEl.appendChild(item);
+    });
+  }
+
+  // 디버그(테스트) 모드일 때만 "이력 보기" 버튼을 노출한다. 평소엔 안 보이고, 꺼지면 패널도 같이 접는다.
+  function refreshHistoryUI() {
+    const debugOn = debugModeEl.checked;
+    histToggleRowEl.style.display = debugOn ? "flex" : "none";
+    if (!debugOn) histWrapEl.classList.add("hidden");
+    if (!histWrapEl.classList.contains("hidden")) renderHistory();
+  }
+
+  histToggleEl.addEventListener("click", () => {
+    histWrapEl.classList.toggle("hidden");
+    if (!histWrapEl.classList.contains("hidden")) renderHistory();
+  });
+
+  histClearEl.addEventListener("click", () => {
+    if (!confirm("이 방의 교정 이력을 전부 삭제할까요?")) return;
+    clearCorrectionHistory(roomId);
+    renderHistory();
+    flashSaved("이력 삭제됨");
+  });
+
   function refreshRoomUI() {
     roomEl.textContent = "Room: " + (roomId ? roomId.slice(0, 24) : "(감지 안 됨)");
     noteEl.value = getNote(roomId);
@@ -2101,6 +2222,7 @@
     refreshPresetUI();
     refreshTokenUI();
     refreshRewriteContextUI(false);
+    refreshHistoryUI();
   }
 
   el("resetTokens").addEventListener("click", () => {
@@ -2116,7 +2238,10 @@
     flashSaved("저장됨");
   });
   enabledEl.addEventListener("change", () => setEnabled(roomId, enabledEl.checked));
-  debugModeEl.addEventListener("change", () => setDebug(roomId, debugModeEl.checked));
+  debugModeEl.addEventListener("change", () => {
+    setDebug(roomId, debugModeEl.checked);
+    refreshHistoryUI();
+  });
   fullRewriteModeEl.addEventListener("change", () => {
     setFullRewriteMode(roomId, fullRewriteModeEl.checked);
     refreshRewriteContextUI(false);
