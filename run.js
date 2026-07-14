@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta User Note Corrector
 // @namespace    zeta-usernote-corrector
-// @version      2.1.0
+// @version      2.0.0
 // @description  유저노트(글자수 제한 없음)를 별도 저장해두고, 제타가 노트 내용과 명백히 모순되는 답변을 낼 때만 그 부분만 find/replace로 고친다. 로어북/장기기억/페르소나는 건드리지 않고, 원본 문체·나머지 내용은 그대로 유지한다.
 // @match        https://zeta-ai.io/*
 // @match        https://*.zeta-ai.io/*
@@ -18,7 +18,7 @@
   }
   window.__ZETA_USERNOTE_CORRECTOR_RUNNING__ = true;
 
-  const VERSION = "2.1.0";
+  const VERSION = "2.0.0";
 
   // ==========================================================
   // 0. 아주 작은 유틸
@@ -132,14 +132,13 @@
     return parts.filter(Boolean).join("\n\n").trim();
   }
 
-  // TEXT 콘텐츠에 있는 speakerName들을 모은다 (지금 답변에서 실제로 "말하고 있는" 캐릭터가 누구인지).
+  // TEXT 콘텐츠에 들어있는 speakerName들을 뽑아낸다 (지금 답변에서 실제로 말하고 있는 캐릭터 이름).
   function extractSpeakerNames(contents) {
     if (!Array.isArray(contents)) return [];
     const names = [];
     contents.forEach((c) => {
       if (c && c.type === "TEXT" && typeof c.speakerName === "string" && c.speakerName.trim()) {
-        const name = c.speakerName.trim();
-        if (!names.includes(name)) names.push(name);
+        if (!names.includes(c.speakerName.trim())) names.push(c.speakerName.trim());
       }
     });
     return names;
@@ -156,6 +155,7 @@
     const uuidish = [];
     let completeText = "";
     let speakers = [];
+    let rawContents = null;
 
     events.forEach((event) => {
       if (!event || typeof event !== "object") return;
@@ -169,6 +169,7 @@
         if (Array.isArray(reply.contents)) {
           completeText = serializeContents(reply.contents);
           speakers = extractSpeakerNames(reply.contents);
+          rawContents = reply.contents;
         }
       }
 
@@ -179,6 +180,7 @@
         if (Array.isArray(cand.contents)) {
           completeText = serializeContents(cand.contents);
           speakers = extractSpeakerNames(cand.contents);
+          rawContents = cand.contents;
         }
       }
 
@@ -217,7 +219,125 @@
     if (!text && cumulative.length) text = pickLongest(cumulative).trim();
     if (!text) text = pickLongest(finals).trim();
 
-    return { text, requestId: ids.requestId, messageId: ids.messageId, candidateId: ids.candidateId, speakers };
+    return { text, requestId: ids.requestId, messageId: ids.messageId, candidateId: ids.candidateId, speakers, contents: rawContents };
+  }
+
+  // ==========================================================
+  // 0.7 전체 재작성 모드용 포맷 변환
+  // (구조화된 JSON contents ↔ "@캐릭터명: *지문* 대사" + ```InfoBox``` 텍스트)
+  // ==========================================================
+
+  function contentsToRewriteFormat(contents) {
+    const parts = [];
+    (contents || []).forEach((c) => {
+      if (!c) return;
+      if (c.type === "TEXT" && typeof c.text === "string") {
+        parts.push(`@${c.speakerName || "?"}: ${c.text}`);
+      } else if (c.type === "INFO_BOX") {
+        const lines = [];
+        (c.scenes || []).forEach((s) => { if (s && typeof s.value === "string") lines.push(`${s.label || ""}: ${s.value}`); });
+        (c.characters || []).forEach((ch) => {
+          if (!ch) return;
+          lines.push(`[${ch.name || "?"}]`);
+          (ch.items || []).forEach((it) => { if (it && typeof it.value === "string") lines.push(`${it.label || ""}: ${it.value}`); });
+        });
+        if (lines.length) parts.push("```InfoBox\n" + lines.join("\n") + "\n```");
+      }
+    });
+    return parts.join("\n");
+  }
+
+  // AI가 재작성한 텍스트를, 원본 contents와 최대한 같은 구조(라벨/이모지 등)로 되돌려 파싱한다.
+  function rewriteFormatToContents(text, originalContents) {
+    let body = String(text || "");
+    let infoBoxBlock = null;
+    const ibMatch = body.match(/```InfoBox\s*([\s\S]*?)```/i);
+    if (ibMatch) {
+      infoBoxBlock = ibMatch[1].trim();
+      body = (body.slice(0, ibMatch.index) + body.slice(ibMatch.index + ibMatch[0].length)).trim();
+    }
+
+    // "@이름: 내용" 구간들을 순서대로 잘라낸다.
+    const marks = [];
+    const re = /^@([^:\n]{1,30}):[ \t]*/gm;
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      marks.push({ name: m[1].trim(), index: m.index, contentStart: m.index + m[0].length });
+    }
+    const segments = [];
+    for (let i = 0; i < marks.length; i++) {
+      const end = i + 1 < marks.length ? marks[i + 1].index : body.length;
+      const raw = body.slice(marks[i].contentStart, end).trim();
+      if (raw) segments.push({ name: marks[i].name, text: raw });
+    }
+
+    const origTextList = (originalContents || []).filter((c) => c && c.type === "TEXT");
+    const newContents = segments.map((seg, idx) => {
+      const orig = origTextList.find((c) => c.speakerName === seg.name) || origTextList[idx] || origTextList[0];
+      return {
+        type: "TEXT",
+        speakerName: seg.name,
+        position: orig ? orig.position : "LEFT",
+        text: seg.text
+      };
+    });
+
+    const origInfoBox = (originalContents || []).find((c) => c && c.type === "INFO_BOX");
+    if (infoBoxBlock) {
+      const parsed = parseInfoBoxBlock(infoBoxBlock, origInfoBox);
+      if (parsed) newContents.push(parsed);
+    } else if (origInfoBox) {
+      // AI가 상태창을 안 돌려줬으면(누락) 원본 상태창을 그대로 보존한다 — 새로 지어내거나 없애지 않는다.
+      newContents.push(origInfoBox);
+    }
+
+    return newContents.length ? newContents : null;
+  }
+
+  // "라벨: 값" 줄들과 "[캐릭터명]" 헤더로 이루어진 InfoBox 텍스트를 원본과 같은 구조로 되돌린다.
+  // 라벨은 최대한 원본의 정확한 문자열(이모지 포함)을 재사용해서, AI가 이모지를 다르게 써도 안전하게 만든다.
+  function parseInfoBoxBlock(text, origInfoBox) {
+    const origSceneLabels = (origInfoBox && origInfoBox.scenes || []).map((s) => s.label);
+    const origCharLabelsByName = {};
+    (origInfoBox && origInfoBox.characters || []).forEach((ch) => {
+      origCharLabelsByName[ch.name] = (ch.items || []).map((it) => it.label);
+    });
+
+    function matchLabel(rawLabel, candidates) {
+      const norm = String(rawLabel || "").replace(/[^\p{L}\p{N}]/gu, "");
+      const found = (candidates || []).find((c) => String(c || "").replace(/[^\p{L}\p{N}]/gu, "") === norm);
+      return found || rawLabel;
+    }
+
+    const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const scenes = [];
+    const charMap = {};
+    let currentChar = null;
+    lines.forEach((line) => {
+      const headerMatch = line.match(/^\[(.+)\]$/);
+      if (headerMatch) {
+        currentChar = headerMatch[1].trim();
+        if (!charMap[currentChar]) charMap[currentChar] = [];
+        return;
+      }
+      const kv = line.match(/^(.+?):[ \t]*(.+)$/);
+      if (!kv) return;
+      const label = kv[1].trim();
+      const value = kv[2].trim();
+      if (currentChar) {
+        const candidates = origCharLabelsByName[currentChar] || [];
+        charMap[currentChar].push({ label: matchLabel(label, candidates), value });
+      } else {
+        scenes.push({ label: matchLabel(label, origSceneLabels), value });
+      }
+    });
+
+    if (!scenes.length && !Object.keys(charMap).length) return null;
+    return {
+      type: "INFO_BOX",
+      scenes,
+      characters: Object.keys(charMap).map((name) => ({ name, items: charMap[name] }))
+    };
   }
 
   function isStreamEndpoint(url, method) {
@@ -269,11 +389,109 @@
   }
 
   // ==========================================================
+  // 0.5 인증 토큰 캡처 + 로어북/캐릭상세/유저상세 조회
+  // (전체 재작성 모드에서 컨텍스트를 직접 가져오기 위해 필요 — 이 스크립트는
+  // 원래 응답만 가로챘지, 제타 API에 직접 요청을 보낸 적이 없어서 새로 추가함)
+  // ==========================================================
+
+  let capturedAuth = null;
+  const plotIdCache = {}; // roomId -> plotId
+
+  function extractAuthFromHeaders(headers) {
+    if (!headers) return null;
+    try {
+      if (typeof headers.get === "function") {
+        return headers.get("authorization") || headers.get("Authorization");
+      }
+      if (Array.isArray(headers)) {
+        for (const pair of headers) {
+          if (pair && pair[0] && String(pair[0]).toLowerCase() === "authorization") return pair[1];
+        }
+        return null;
+      }
+      for (const k in headers) {
+        if (k.toLowerCase() === "authorization") return headers[k];
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  const ROOM_URL = (id) => `https://api.zeta-ai.io/v1/rooms/${id}`;
+  const PLOT_CREATOR_URL = (id) => `https://api.zeta-ai.io/v1/plots/${id}/creator`;
+  const LOREBOOK_URL = (id) => `https://api.zeta-ai.io/v1/lorebooks/${id}`;
+  const PROFILES_LIST_URL = (plotId) => `https://api.zeta-ai.io/v1/user-chat-profiles?plotId=${plotId}`;
+  const REC_ME_URL = (roomId) => `https://api.zeta-ai.io/v1/rooms/${roomId}/user-plot-chat-profiles/me`;
+
+  async function apiGet(url) {
+    if (!capturedAuth) return null;
+    try {
+      const res = await originalFetch(url, { headers: { "Authorization": capturedAuth } });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+
+  async function resolvePlotId(roomId) {
+    if (plotIdCache[roomId]) return plotIdCache[roomId];
+    const data = await apiGet(ROOM_URL(roomId));
+    if (data && data.plot && data.plot.id) {
+      plotIdCache[roomId] = data.plot.id;
+      return data.plot.id;
+    }
+    return null;
+  }
+
+  // {{char}} 상세를 사람이 읽을 수 있는 텍스트로 요약한다.
+  async function fetchCharDetailText(plotId) {
+    const data = await apiGet(PLOT_CREATOR_URL(plotId));
+    const draft = data && data.draft;
+    if (!draft) return "";
+    const parts = [];
+    if (draft.longDescription) parts.push("[기본설정]\n" + draft.longDescription);
+    if (draft.narrator) parts.push("[내레이터 설정]\n" + draft.narrator);
+    (draft.characters || []).forEach((c) => {
+      if (c && c.description) parts.push(`[캐릭터: ${c.name || "?"}]\n` + c.description);
+    });
+    return { text: parts.join("\n\n"), draft };
+  }
+
+  // 이 방에 연결된 로어북들의 항목을 전부 모아 텍스트로 합친다.
+  async function fetchLorebookText(lorebookIds) {
+    if (!Array.isArray(lorebookIds) || !lorebookIds.length) return "";
+    const results = await Promise.all(lorebookIds.map((id) => apiGet(LOREBOOK_URL(id))));
+    const parts = [];
+    results.forEach((lb) => {
+      if (!lb) return;
+      (lb.items || []).forEach((it) => {
+        if (it && it.content) parts.push(`[${it.name || "?"}]\n` + it.content);
+      });
+    });
+    return parts.join("\n\n");
+  }
+
+  // 지금 이 방에서 실제로 쓰이고 있는 {{user}} 페르소나 설명을 가져온다
+  // (추천 프로필이 선택돼 있으면 그쪽, 아니면 내 페르소나 목록에서 selected:true인 것).
+  async function fetchPersonaText(roomId, plotId) {
+    const [recMe, list] = await Promise.all([
+      apiGet(REC_ME_URL(roomId)),
+      apiGet(PROFILES_LIST_URL(plotId))
+    ]);
+    if (recMe && typeof recMe.description === "string" && recMe.description.trim()) {
+      return recMe.description;
+    }
+    const profiles = list && list.userChatProfiles;
+    if (Array.isArray(profiles)) {
+      const sel = profiles.find((p) => p && p.selected);
+      if (sel && sel.description) return sel.description;
+    }
+    return "";
+  }
+
+  // ==========================================================
   // 1. 저장소 (localStorage) - 노트 / API 프리셋
   // ==========================================================
 
   const LS_NOTE_PREFIX = "zeta-unc-note-";
-  const LS_ROSTER_PREFIX = "zeta-unc-roster-"; // 방별 등장인물 목록 (쉼표 구분) - 노트 자동 필터링용
   const LS_PRESETS_KEY = "zeta-unc-api-presets";
   const LS_ACTIVE_PRESET_PREFIX = "zeta-unc-active-preset-";
   const LS_ENABLED_PREFIX = "zeta-unc-enabled-"; // 방별 on/off
@@ -285,41 +503,12 @@
     localStorage.setItem(LS_NOTE_PREFIX + roomId, text || "");
   }
 
-  function getRoster(roomId) {
-    return localStorage.getItem(LS_ROSTER_PREFIX + roomId) || "";
-  }
-  function saveRoster(roomId, text) {
-    localStorage.setItem(LS_ROSTER_PREFIX + roomId, text || "");
-  }
-  // "김젯시, 이젯시, 박젯시" 같은 쉼표 구분 문자열을 이름 배열로 변환 (공백 제거, 빈 항목 제거, 중복 제거)
-  function parseRoster(text) {
-    const seen = new Set();
-    const out = [];
-    String(text || "").split(",").forEach((raw) => {
-      const name = raw.trim();
-      if (!name || seen.has(name)) return;
-      seen.add(name);
-      out.push(name);
-    });
-    return out;
-  }
-
   function getEnabled(roomId) {
     const v = localStorage.getItem(LS_ENABLED_PREFIX + roomId);
     return v === null ? true : v === "1";
   }
   function setEnabled(roomId, on) {
     localStorage.setItem(LS_ENABLED_PREFIX + roomId, on ? "1" : "0");
-  }
-
-  // ---- 교정 모드 : "conflict"(기존 find/replace) 또는 "full"(완성 답변 통째 재작성 후 자동 diff) ----
-  const LS_MODE_PREFIX = "zeta-unc-mode-";
-  function getMode(roomId) {
-    const v = localStorage.getItem(LS_MODE_PREFIX + roomId);
-    return v === "full" ? "full" : "conflict"; // 기본값은 항상 기존 방식
-  }
-  function setMode(roomId, mode) {
-    localStorage.setItem(LS_MODE_PREFIX + roomId, mode === "full" ? "full" : "conflict");
   }
 
   // ---- 이미 적용했던 교정 내용 기억 (스트림 이후 다른 API가 원본으로 덮어쓰는 것을 방지) ----
@@ -402,47 +591,6 @@
     const list = getPresets();
     const id = getActivePresetId(roomId);
     return list.find((p) => p.id === id) || list[0] || null;
-  }
-
-  // ==========================================================
-  // 1.5 노트 화자 필터링 (코드 레벨, AI 호출 없이 처리)
-  // ==========================================================
-  // 목적: AI에게 "이 노트 내용이 지금 화자와 관련 있는지"를 추론시키는 대신,
-  // 등장인물 이름 목록(roster)을 기준으로 코드가 미리 걸러낸다.
-  // - roster가 비어있으면 필터링을 하지 않고 노트 전체를 그대로 넘긴다 (기존 동작과 동일, 하위호환).
-  // - 노트는 빈 줄(빈 줄 하나 이상) 기준으로 "항목"으로 나눈다.
-  // - 각 항목 텍스트 안에 roster 이름이 몇 개가 등장하는지 본다.
-  //   - roster 이름이 하나도 안 나오면(일반적인 설정/전역 사실) -> 항상 포함
-  //   - 지금 화자 이름이 등장하면 -> 포함 (화자 본인 관련 사건이거나, 화자가 그 사건을 알고 있다는 근거로 봄)
-  //   - roster 이름은 나오는데 그 중에 지금 화자 이름이 전혀 없으면 -> 이번 화자와는 무관한 사건으로 보고 제외
-
-  function splitNoteEntries(note) {
-    return String(note || "")
-      .split(/\r?\n\s*\r?\n+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-
-  function filterNoteForSpeakers(note, speakerNames, rosterNames) {
-    const entries = splitNoteEntries(note);
-    if (!entries.length) return { text: "", keptCount: 0, totalCount: 0, filtered: false };
-
-    if (!Array.isArray(rosterNames) || !rosterNames.length) {
-      // roster 미설정 -> 필터링 안 함 (기존 동작 유지)
-      return { text: entries.join("\n\n"), keptCount: entries.length, totalCount: entries.length, filtered: false };
-    }
-
-    const speakers = (Array.isArray(speakerNames) ? speakerNames : []).filter(Boolean);
-
-    const kept = entries.filter((entry) => {
-      const mentionedRosterNames = rosterNames.filter((name) => entry.includes(name));
-      if (!mentionedRosterNames.length) return true; // 특정 인물 얘기가 아닌 일반 항목 -> 항상 포함
-      if (!speakers.length) return true; // 화자를 특정 못 하면 안전하게 포함 (걸러내지 않음)
-      const speakerMentioned = speakers.some((sp) => mentionedRosterNames.includes(sp) || entry.includes(sp));
-      return speakerMentioned;
-    });
-
-    return { text: kept.join("\n\n"), keptCount: kept.length, totalCount: entries.length, filtered: true };
   }
 
   // ==========================================================
@@ -578,7 +726,6 @@
     const system = [
       "당신은 대화 로그 검수자다. 아래 [유저노트]에 적힌 확정 사실·현재 상태와, [제타 원본 답변]을 대조한다.",
       "[지금 답변하는 캐릭터]는 이번 답변에서 실제로 말하고 있는 인물이다.",
-      "[유저노트]는 이미 지금 화자와 관련 있는 항목만 걸러져서 전달된 것이다 (관련 없는 다른 인물 단독 사건은 이미 제외됨).",
       "[제타 원본 답변]에는 대사/지문(TEXT) 외에 [상태창], [캐릭터명] 같은 대괄호 섹션이 있을 수 있는데,",
       "이건 그 답변에 같이 딸려온 상태창(날짜/장소/속마음 등) 정보를 라벨: 값 형태로 풀어놓은 것이다. 이 값들도 검수 대상이다.",
       "임무는 명백히 모순되는 부분만 찾아서 고치는 것이지, 전체를 다시 쓰는 것이 아니다.",
@@ -593,46 +740,32 @@
       "5. find가 원본 안에 여러 번 나올 수 있다. 그 경우 모든 위치에 같은 replace를 적용해도 뜻이 통하는 문구로 find를 잡는다.",
       "   (문맥에 따라 다르게 고쳐야 하는 상황이면, 그 문맥까지 포함해서 find를 더 길고 구체적으로 잡아 그 자리만 특정한다.)",
       "6. replace는 모순만 해소하도록 최소한으로 고친 문장/값이며, 원본의 문체와 어울려야 한다.",
-      "7. 유저노트 문장에 '어제/오늘/방금/지금' 같은 과거→현재로 이어지는 시간 표현이 있으면,",
-      "   그 문장이 뜻하는 현재 상태까지 추론해서 대조한다.",
+      "7. 유저노트 문장에 '어제/오늘/방금/지금' 같은 시간 표현이 있으면, 그 문장이 뜻하는 현재 상태까지 추론해서 대조한다.",
       "   (예: 노트에 '어제 부산에 놀러갔다가 오늘 집에 옴'이라고 적혀있는데, 원본 답변이 화자가 여전히 부산에 있는 것처럼",
       "   서술하면 -- '지금은 집에 있어야 한다'는 함의와 모순되는 것으로 본다.) 단, 노트에 안 적힌 화제까지 추측해서",
       "   새로 만들어내지는 않는다 -- 오직 노트 문장이 실제로 뜻하는 현재 상태와의 모순만 본다.",
-      "8. 반대로 유저노트 문장에 '내일/다음 주/이따가/오늘 저녁/~할 예정' 같이 아직 오지 않은 시점을 가리키는",
-      "   표현이 있으면, 그 사건은 어디까지나 '예정된 미래 계획'일 뿐, 지금 이 순간 실제로 일어나고 있거나",
-      "   이미 일어난 일이 아니다. 이런 노트 항목은 대조 대상에서 완전히 배제한다 -- 원본 답변 속 장면의",
-      "   날짜/장소/상황이 노트가 가리키는 그 미래 시점과 명백히 일치하는 경우(예: 노트가 '내일 폐병원 정찰'이라",
-      "   적혀있고, 원본 답변의 [상태창] 날짜가 실제로 그 다음날이고 장소도 폐병원인 경우)에만 예외적으로",
-      "   대조 대상으로 삼는다. 그 외에는 원본 답변에 그 예정된 사건의 키워드(장소명, 행동명 등)가 우연히",
-      "   비슷하게 등장하더라도 -- 지금이 아직 그 시점이 아니라면 -- 그것을 이유로 원본을 그 미래 사건이",
-      "   진행 중인 것처럼 고치지 않는다. 애매하면 손대지 않는다.",
+      "8. [유저노트]의 각 문장이 누구에 관한/누구 사이의 사건인지 먼저 판단한다. 그 사건의 당사자가 아니거나,",
+      "   그 사건을 알고 있다는 근거가 원본 답변 안에 없는 [지금 답변하는 캐릭터]의 대사에, 표현이 우연히 비슷하다는",
+      "   이유만으로 그 노트 내용을 끼워넣지 않는다. (예: '재하가 승아에게 고백했다가 거절당했다'는 재하·승아 둘만의",
+      "   사건인데, 완전히 다른 화제로 말하던 선우의 대사에 이 내용을 갖다 붙이지 않는다.) 노트가 명시한 당사자 본인의",
+      "   발언이거나, 원본 답변 자체에 그 인물이 그 사건을 알고 있다는 명확한 근거가 있을 때만 적용한다.",
       "9. 수정을 반영했을 때, 그 수정 내용이 [제타 원본 답변]의 다른 부분과 새로 모순을 만들면 안 된다.",
       "   만약 원본 안에 이미 있는 다른 문구가 지금 고치려는 내용과 서로 충돌한다면(예: 한쪽은 '아직 고백 안 함',",
       "   다른 한쪽은 '이미 고백함'), 그 충돌하는 다른 부분도 conflicts에 같이 추가해서 답변 전체가 앞뒤가",
       "   맞도록 만든다. 한 군데만 고치고 바로 근처의 모순을 그대로 방치하지 않는다.",
-      "   이런 연쇄 충돌은 특히 [상태창] 값에서 잘 발생한다. 대사/지문을 고쳤는데 상태창의 감정/장소/관계",
-      "   항목이 그대로 남아 어긋나는 경우가 흔하다.",
-      "   (예: 노트 때문에 대사를 '이제 괜찮아졌어'로 고쳤는데, 같은 답변의 상태창에 '감정: 극도의 불안'이",
-      "   그대로 남아있으면, 이것도 함께 conflicts에 넣어 상태창 쪽 감정값도 누그러뜨린다.)",
-      "   (예: 노트 때문에 화자의 위치를 '집'으로 고쳤는데, 상태창의 '장소'가 여전히 '폐병원'으로 남아있으면",
-      "   상태창 장소 값도 함께 고친다.)",
       "10. replace를 만들 때 [유저노트]의 문장을 그대로 베껴쓰지 않는다. 유저노트는 사실을 정리해둔 메모일 뿐,",
       "    실제 대사가 아니다. [지금 답변하는 캐릭터]가 [이번 유저 메시지]를 보낸 상대에게 지금 이 순간 직접",
       "    말하는 것처럼, 시제(과거형으로 쓰여있어도 '지금도 그렇다'는 뜻이면 현재형으로)와 인칭(노트에 3인칭으로",
       "    적혀있어도 화자 본인 얘기면 '나는', 상대방 얘기면 '너는'으로)을 자연스럽게 바꿔서 쓴다.",
-      "    (예: 노트에 '재하는 젯시를 3년동안 좋아했다'라고 적혀있어도, 재하 본인이 젯시에게 직접 말하는",
+      "    (예: 노트에 '재하는 승아를 3년동안 좋아했다'라고 적혀있어도, 재하 본인이 승아에게 직접 말하는",
       "    상황이면 '나 너 3년 동안 좋아했어' 처럼 화자-청자 관계에 맞게 바꿔서 자연스러운 대사로 만든다.)",
-      "    (예: 노트에 '승아는 그 사실을 이미 알고 있었다'라고 적혀있고, 화자가 승아 본인이 아니라 승아에게",
-      "    말을 거는 상대방이면 -- '너 이미 알고 있었잖아'처럼 2인칭으로 바꾼다.)",
-      "    (예: 노트에 '재하는 3년째 그 카페에서 일했다'처럼 과거형이지만 지금도 유효한 사실이면,",
-      "    화자 본인 얘기일 때 '나 3년째 여기서 일해'처럼 현재형 1인칭으로 바꾼다.)",
       "11. 유저노트 원문에 '~도', '역시', '마찬가지로'처럼 다른 인물과 비교하거나 같은 처지임을 나타내는",
       "    표현이 있으면, replace에도 그 뉘앙스를 그대로 살린다. 이런 표현을 빼고 밋밋한 단정문으로 바꾸지 않는다.",
       "    (예: 노트에 '선우도(재하처럼) 3년 동안 좋아했다'라고 적혀있으면, replace도 '나는 3년 동안'이 아니라",
       "    '나도 3년 동안'처럼 비교/공유의 의미를 유지해서 쓴다.)",
       "12. 노트에 적힌 사건을 [이번 유저 메시지]를 보낸 상대방(청자) 본인이 이미 직접 겪은 당사자라면,",
       "    그 사건을 상대방이 몰랐던 새로운 정보인 것처럼 처음부터 다시 설명/나열하는 문장을 만들지 않는다.",
-      "    (예: 젯시 본인이 재하에게 고백받고 거절한 당사자인데, 젯시에게 '재하가 너한테 고백했었고, 너도",
+      "    (예: 승아 본인이 재하에게 고백받고 거절한 당사자인데, 승아에게 '재하가 너한테 고백했었고, 너도",
       "    거절했었지'처럼 그 사건 자체를 새삼스럽게 되짚어 알려주지 않는다. 그 사실을 이미 전제로 깔고,",
       "    거기서 이어지는 감정/반응/화제만 자연스럽게 언급한다.)",
       "13. 모순이 없으면 conflicts를 빈 배열로 반환한다.",
@@ -659,146 +792,286 @@
   }
 
   // ==========================================================
-  // 3.1 "전체 교체" 모드 : 완성된 답변을 통째로 다시 쓰게 한 뒤,
-  //      원본과 블록 단위로 자동 diff해서 conflicts 배열로 변환한다.
-  //      (find/replace 모드와 똑같은 안전장치를 그대로 재사용하기 위함)
+  // 2.7 전체 재작성 모드 — find/replace가 아니라 답변 전체를 다시 씀.
+  // 로어북/{{char}} 상세/{{user}} 상세/유저노트를 전부 컨텍스트로 같이 준다.
   // ==========================================================
 
-  function buildFullReplacePrompt(note, userText, originalReply, speakerNames) {
-    const speakerLine = (Array.isArray(speakerNames) && speakerNames.length)
-      ? speakerNames.join(", ")
-      : "(알 수 없음)";
+  const FULL_REWRITE_SYSTEM_PROMPT = [
+    "수정 답변은 제타 수정창에 그대로 넣을 수 있는 본문만 작성한다.",
+    "검토 설명, 수정 이유, 제목, 항목 구분, 해설은 출력하지 않는다.",
+    "",
+    "출력은 가능하면 하나의 대화 말풍선에 통합한다.",
+    "형식은 기본적으로 `@캐릭터명: 내용`을 유지한다.",
+    "나래이터 단독 출력은 최소화하고, 필요한 지문은 해당 캐릭터 말풍선 안에 함께 넣는다.",
+    "",
+    "지문은 반드시 `*...*` 안에 작성한다.",
+    "지문 문장 끝맺음은 서술형 `~다` 체를 기본으로 한다.",
+    "예: `@캐릭터명: *잠시 시선을 내리깐다.* 그래서, 네 말은 그게 전부인가.`",
+    "",
+    "긴 지문은 압축한다.",
+    "불필요한 심리 설명, 배경 설명, 반복 행동은 줄이고, 행동 중심으로 정리한다.",
+    "예: `그는 당황한 듯 숨을 들이마시고, 손끝을 떨며 시선을 피했다.` → `*숨을 삼키며 시선을 피한다.*`",
+    "",
+    "중복 감정 표현은 하나로 합친다.",
+    "`불안했다, 초조했다, 마음이 흔들렸다`처럼 겹치는 감정은 반복 설명하지 말고, 행동 하나로 보여준다.",
+    "",
+    "대사는 함부로 줄이지 않는다.",
+    "캐릭터의 말투, 위압감, 플러팅, 거친 느낌, 비꼬는 뉘앙스는 유지한다.",
+    "짧게 정리할 때도 대사를 단답으로 만들지 말고, 주로 지문을 덜어내는 방식으로 압축한다.",
+    "",
+    "말풍선 수를 과하게 늘리지 않는다.",
+    "가능하면 1개 말풍선 안에 정리하고, 길어질 경우에만 감정 변화나 행동 전환 기준으로 2~3개 정도로 나눈다.",
+    "짧은 나래이터 말풍선 `@:`는 가급적 캐릭터 말풍선 안의 지문으로 흡수한다.",
+    "",
+    "사건 진행은 바꾸지 않는다.",
+    "행동 순서, 관계성, 감정 방향, 대사 의미는 원문과 동일하게 유지한다.",
+    "새 사건을 만들거나 분위기를 순하게 바꾸지 않는다.",
+    "",
+    "최종 출력은 아래 형식에 가깝게 작성한다.",
+    "",
+    "`@캐릭터명: *지문을 짧게 정리한다.* 대사를 이어서 작성한다. *필요한 행동이나 분위기만 덧붙인다.* 이어지는 대사를 작성한다.`",
+    "",
+    "로어북의 캐릭터 성격과 관계성을 최우선으로 유지한다.",
+    "",
+    "캐릭터가 원래 하지 않을 법한 말투나 행동으로 순화하지 않는다.",
+    "차갑게 말하는 캐릭터는 차가운 결을 유지하고, 능글맞은 캐릭터는 능글맞은 여유를 유지하며, 다정한 캐릭터는 다정함을 유지한다.",
+    "단, 과장해서 다른 성격처럼 보이게 만들지는 않는다.",
+    "",
+    "{{char}}와 {{user}}의 현재 관계 단계를 유지한다.",
+    "아직 어색한 관계라면 갑자기 과하게 친밀하게 만들지 않고, 이미 가까운 관계라면 불필요하게 거리감을 되돌리지 않는다.",
+    "호감, 긴장감, 신뢰, 오해, 경계심, 미련 등 현재 감정선을 원문보다 약하게 만들지 않는다.",
+    "",
+    "대사의 의미와 감정 방향은 유지한다.",
+    "수정 과정에서 캐릭터의 의도, 주도권, 반응 강도, 플러팅 수위, 갈등의 날카로움, 장면의 긴장감을 임의로 바꾸지 않는다.",
+    "필요한 경우 지문만 줄이고, 캐릭터의 핵심 대사는 최대한 보존한다.",
+    "",
+    "로어북과 충돌하는 부분은 자연스럽게 고치되, 설명문처럼 티 나게 수정하지 않는다.",
+    "설정 보정은 캐릭터가 실제로 그 상황에서 할 법한 말과 행동 안에 녹인다.",
+    "",
+    "최종 답변은 \u201c설정에 맞는 설명\u201d이 아니라 \u201c캐릭터가 실제로 이어서 말하고 행동하는 장면\u201d처럼 작성한다.",
+    "",
+    "인접한 지문 블록은 분리하지 말고 연결한다.",
+    "`*지문* *지문* 대사 *지문*`처럼 지문이 연속으로 두 번 이상 나오는 출력은 피한다.",
+    "같은 말풍선 안에서 지문이 이어질 경우 하나의 `*...*` 안에 합치거나, 중간에 자연스러운 대사를 배치해 `*지문* 대사 *지문*` 흐름으로 정리한다.",
+    "예: `*고개를 숙인다.* *손끝이 떨린다.* 괜찮아.` → `*고개를 숙인 채 떨리는 손끝을 감춘다.* 괜찮아.`",
+    "",
+    "여성향 로맨스 톤을 우선한다.",
+    "{{user}}를 성적 대상, 소유물, 감정 배출구처럼 다루지 않는다.",
+    "{{user}}의 감정, 망설임, 거절, 선택권, 거리감을 존중한다.",
+    "로맨스는 신체 소비보다 감정선, 말투, 시선, 거리감, 배려, 긴장감, 관계 변화로 표현한다.",
+    "",
+    "여성비하적 욕설, 성적 모욕, 성별 고정관념에 기반한 비난은 사용하지 않는다.",
+    "여성비하 욕설, 성적 경험을 비난하는 표현, 순결이나 몸가짐을 평가하는 표현, 여성을 낮춰 부르는 표현은 캐릭터 말투가 거칠더라도 출력하지 않는다.",
+    "거친 말투가 필요할 경우 성별 비하가 아닌 일반적인 감정 표현, 냉소, 비꼼, 짧은 압박감으로 대체한다.",
+    "",
+    "남성향식 신체 대상화 묘사를 피한다.",
+    "{{user}}를 몸매 평가, 성적 훑어보기, 순결성 평가, 소유물처럼 보는 시선으로 묘사하지 않는다.",
+    "{{user}}를 묘사할 때는 신체보다 표정, 시선, 목소리, 태도, 망설임, 감정 변화, 거리감 중심으로 작성한다.",
+    "",
+    "캐릭터 신체 묘사는 여성향 로맨스 톤에 맞게 사용한다.",
+    "{{char}}가 성인 캐릭터일 경우, {{char}}의 신체와 매력은 비교적 노골적으로 묘사할 수 있다.",
+    "단, {{char}}의 신체 묘사는 단순한 부위 나열이나 감상문처럼 쓰지 않고, 장면의 감정선, 긴장감, 욕망, 거리감, 안정감, 위험한 매력을 살리는 방향으로 작성한다.",
+    "{{char}}의 신체 조건이 캐릭터성에 중요한 경우에는 체격, 움직임, 힘의 균형, 존재감, 분위기를 더 선명하게 묘사할 수 있다.",
+    "묘사는 대사와 감정 흐름을 방해하지 않도록 장면 안에 자연스럽게 배치한다.",
+    "",
+    "{{char}}의 노골적인 신체 묘사는 허용하되, {{user}}를 성적 대상이나 소유물처럼 소비하는 방향으로 이어지지 않게 한다.",
+    "{{char}}가 {{user}}를 바라보는 장면에서도 몸매 평가, 성적 훑어보기, 순결성 평가, 여성비하적 표현, 소유물화 표현은 피한다.",
+    "로맨스의 욕망은 {{user}}를 깎아내리거나 소비하는 방식이 아니라, {{char}}의 절제, 흔들림, 시선, 말투, 거리 조절, 감정선으로 표현한다.",
+    "",
+    "스킨십과 플러팅은 관계 단계와 장면의 동의 분위기에 맞게 작성한다.",
+    "갑작스러운 강압적 접촉, 원치 않는 밀착, 위협을 로맨틱하게 포장하지 않는다.",
+    "집착, 질투, 소유욕이 필요한 캐릭터라도 폭력, 협박, 모욕, 통제욕을 매력처럼 미화하지 않는다.",
+    "불안정한 감정은 말투, 침묵, 시선, 거리감, 행동의 절제로 표현한다.",
+    "",
+    "{{user}}를 지나치게 수동적이거나 무조건 부끄러워하는 인물로 고정하지 않는다.",
+    "{{user}}는 받아치거나, 거리를 두거나, 솔직하게 흔들리거나, 장난스럽게 넘기거나, 단호하게 거절할 수 있다.",
+    "캐릭터의 매력은 {{user}}의 주체성을 꺾는 방식이 아니라, 관계 안에서 긴장과 감정선을 만드는 방식으로 드러낸다.",
+    "",
+    "말풍선 수를 과하게 늘리지 않는다.",
+    "",
+    "[상태창 처리 규칙]",
+    "",
+    "상태창 출력 형식",
+    "```InfoBox",
+    "내용",
+    "```",
+    "",
+    "최근 대화 또는 검토 대상 답변에 상태창이 포함되어 있다면, 수정 답변에서도 상태창을 유지한다.",
+    "",
+    "상태창은 삭제하지 말고, 기존 상태창의 형식과 항목 구조를 최대한 그대로 따른다.",
+    "단, 답변 본문을 수정하면서 감정, 관계, 위치, 분위기, 상태 수치, 약속, 진행 상황 등이 달라졌다면 그 변경 내용을 반영해 상태창 내용도 자연스럽게 갱신한다.",
+    "",
+    "상태창은 단순 복붙이 아니라, 수정된 답변 본문과 충돌하지 않도록 함께 검토한다.",
+    "본문에서는 감정이 누그러졌는데 상태창에는 극단적인 감정이 남아 있거나, 본문에서는 거리가 가까워졌는데 상태창에는 거리감이 유지되는 식의 불일치가 없도록 한다.",
+    "",
+    "다만 상태창에 확정되지 않은 정보, 유저의 속마음 단정, 유저 행동 대리 서술을 새로 추가하지 않는다.",
+    "수정된 답변과 직접 관련 없는 상태창 항목은 기존 내용을 유지하거나 최소한으로만 정리한다.",
+    "",
+    "상태창이 원문에 없었다면 새로 만들지 않는다.",
+    "상태창이 원문에 있었다면 최종 출력에도 상태창을 포함한다.",
+    "",
+    "위 규칙에 더해: 아래 [유저노트]에 적힌 사실과 명백히 모순되는 부분이 있으면 자연스럽게 같이 바로잡는다.",
+    "노트에 없는 화제는 새로 추가하지 않는다. [로어북]과 [캐릭터 상세]도 참고해서 캐릭터 성격/설정과 어긋나지 않게 한다.",
+    "노트에 적힌 사건이 [{{user}} 상세]로 표시된 그 사람 본인이 이미 직접 겪은 일이면, 새삼스럽게 그 사람에게 다시 설명하듯 나열하지 않는다."
+  ].join("\n");
 
-    const system = [
-      "당신은 대화 로그 검수자다. 아래 [유저노트]에 적힌 확정 사실·현재 상태와, [제타 원본 답변]을 대조해서,",
-      "노트와 명백히 모순되는 부분만 고친 최종 답변 전체를 다시 작성한다.",
-      "[지금 답변하는 캐릭터]는 이번 답변에서 실제로 말하고 있는 인물이다.",
-      "[유저노트]는 이미 지금 화자와 관련 있는 항목만 걸러져서 전달된 것이다.",
-      "",
-      "[제타 원본 답변]은 빈 줄로 구분된 여러 블록으로 이루어져 있다.",
-      "각 블록은 순수 대사/지문 블록이거나, '[상태창]' 또는 '[캐릭터명]'으로 시작해서",
-      "'라벨: 값' 형태의 줄들이 이어지는 상태창 블록이다.",
-      "",
-      "출력 형식 (반드시 지킬 것):",
-      "1. 원본과 정확히 같은 개수의 블록을, 정확히 같은 순서로 출력한다. 블록을 추가하거나 삭제하지 않는다.",
-      "2. 상태창 블록은 원본과 정확히 같은 줄 수를 유지하고, 각 줄의 '라벨:' 부분은 절대 바꾸지 않는다.",
-      "   값(라벨 뒤의 내용)만 필요할 때 고친다.",
-      "3. 수정할 필요가 없는 블록/줄은 원본 글자 하나 안 틀리고 그대로 옮겨 적는다 (다듬거나 요약하지 않는다).",
-      "4. 노트와 실제로 모순되는 부분만 최소한으로 고친다. 전체를 새로 쓰거나 문체를 바꾸지 않는다.",
-      "5. JSON이나 설명, 이유, 마크다운 코드펜스 없이, 블록 텍스트만 그대로 출력한다.",
-      "",
-      "모순 판단 규칙:",
-      "a. 유저노트 문장에 '어제/오늘/방금/지금' 같은 과거→현재 시간 표현이 있으면, 그 문장이 뜻하는",
-      "   현재 상태까지 추론해서 대조한다. 노트에 안 적힌 화제까지 추측해서 새로 만들어내지 않는다.",
-      "b. 유저노트 문장에 '내일/다음 주/이따가/~할 예정' 같은 아직 오지 않은 시점 표현이 있으면,",
-      "   그 사건은 예정된 미래 계획일 뿐이다. 원본 답변 속 장면이 실제로 그 미래 시점에 도달한 것이",
-      "   명백한 경우(날짜/장소가 노트가 가리키는 시점과 일치)가 아니라면, 이런 노트 항목은 절대",
-      "   지금 진행 중인 일처럼 반영하지 않는다. 애매하면 손대지 않는다.",
-      "c. replace할 때 [유저노트] 문장을 그대로 베끼지 않는다. [지금 답변하는 캐릭터]가 [이번 유저 메시지]를",
-      "   보낸 상대에게 지금 이 순간 직접 말하듯, 시제(현재도 유효하면 현재형)와 인칭(화자 본인 얘기면 '나는',",
-      "   상대방 얘기면 '너는')을 자연스럽게 바꿔서 쓴다.",
-      "   (예: 노트 '재하는 젯시를 3년동안 좋아했다' + 재하 본인이 젯시에게 말하는 상황 → '나 너 3년 동안 좋아했어')",
-      "   (예: 노트 '승아는 그 사실을 이미 알고 있었다' + 화자가 승아 상대방 → '너 이미 알고 있었잖아')",
-      "d. 노트 원문에 '~도/역시/마찬가지로'처럼 비교·공유 뉘앙스가 있으면 그 뉘앙스를 살린다.",
-      "   (예: '선우도 3년 동안 좋아했다' → '나도 3년 동안'처럼, '나는'으로 밋밋하게 바꾸지 않는다.)",
-      "e. 노트에 적힌 사건을 [이번 유저 메시지]를 보낸 상대방 본인이 이미 겪은 당사자라면, 그 사건을",
-      "   상대방이 몰랐던 새 정보처럼 처음부터 다시 설명하지 않는다. 이미 아는 전제로 두고 이어지는",
-      "   감정/반응만 자연스럽게 언급한다.",
-      "f. 한 곳을 고치면서 답변의 다른 부분(특히 상태창의 감정/장소/관계 값)과 새로 모순이 생기면 안 된다.",
-      "   본문을 고쳤으면 관련된 상태창 값도 함께 자연스럽게 맞춘다.",
-      "   (예: 대사를 '이제 괜찮아졌어'로 고쳤는데 상태창에 '감정: 극도의 불안'이 남아있으면 그 값도 고친다.)",
-      "g. 모순이 없으면 원본을 단 한 글자도 바꾸지 말고 그대로 출력한다."
-    ].join("\n");
-
+  function buildFullRewritePrompt(ctx, userText, originalReplyFormatted) {
+    const speakerLine = (Array.isArray(ctx.speakerNames) && ctx.speakerNames.length) ? ctx.speakerNames.join(", ") : "(알 수 없음)";
     const user = [
       "[지금 답변하는 캐릭터]",
       speakerLine,
       "",
+      "[로어북]",
+      ctx.lorebookText || "(없음)",
+      "",
+      "[캐릭터 상세]",
+      ctx.charDetailText || "(없음)",
+      "",
+      "[{{user}} 상세]",
+      ctx.personaText || "(없음)",
+      "",
       "[유저노트]",
-      note,
+      ctx.note || "(없음)",
       "",
       "[이번 유저 메시지]",
       userText || "(없음)",
       "",
-      "[제타 원본 답변]",
-      originalReply
+      "[검토 대상 답변]",
+      originalReplyFormatted
     ].join("\n");
-
-    return { system, user };
+    return { system: FULL_REWRITE_SYSTEM_PROMPT, user };
   }
 
-  // originalReply / revisedReply를 "\n\n" 기준 블록으로 나눈다.
-  // serializeContents가 부분들을 "\n\n"으로 join하는 방식과 대응된다.
-  function splitEnvelopeBlocks(text) {
-    return String(text || "").split(/\n\n+/).map((b) => b.trim()).filter(Boolean);
+  // 방(roomId)별로 로어북/{{char}} 상세를 캐싱한다 (매 메시지마다 새로 긁어오면 느리고 API 호출도 낭비).
+  // {{user}} 상세(페르소나)는 자주 바뀔 수 있어 매번 새로 가져온다.
+  const roomContextCache = {};
+
+  async function getRoomContext(roomId) {
+    if (roomContextCache[roomId]) return roomContextCache[roomId];
+    const plotId = await resolvePlotId(roomId);
+    if (!plotId) return null;
+    const charResult = await fetchCharDetailText(plotId);
+    const lorebookIds = charResult && charResult.draft && charResult.draft.lorebookIds;
+    const lorebookText = await fetchLorebookText(lorebookIds);
+    const ctx = { plotId, charDetailText: (charResult && charResult.text) || "", lorebookText: lorebookText || "" };
+    roomContextCache[roomId] = ctx;
+    return ctx;
   }
 
-  // 상태창류 블록("[라벨]"로 시작)의 각 줄을 "라벨: 값" 기준으로 분리한다.
-  function splitLabelValue(line) {
-    const idx = line.indexOf(": ");
-    if (idx === -1) return null;
-    return { label: line.slice(0, idx), value: line.slice(idx + 2) };
-  }
+  // 구조화된 contents(TEXT+INFO_BOX)를 통째로 교체하는 패치 — find/replace가 아니라
+  // 최종 완성 블록(CHAT_COMPLETE/CANDIDATE_COMPLETE)의 contents 자체를 새 것으로 바꿔치기한다.
+  function patchStructuredContents(rawText, envelope, newContents) {
+    const parts = String(rawText || "").split(/(\r?\n\r?\n)/);
+    let changed = false;
 
-  // 전체 교체 모드의 핵심 안전장치: AI가 다시 쓴 전체 답변을 원본과 블록 단위로 비교해서,
-  // 실제로 바뀐 부분만 찾아 find/replace 쌍으로 변환한다.
-  // - 블록 개수가 다르면 전체를 신뢰할 수 없다고 보고 통째로 폐기(unsafe)한다.
-  // - 상태창 블록은 줄 단위로, 라벨이 같은 줄만 값(value)을 비교해서 find/replace로 만든다.
-  //   (라벨 자체가 달라졌거나 줄 수가 안 맞으면 그 블록/줄은 건드리지 않고 건너뛴다.)
-  // - 일반 대사/지문 블록은 블록 전체를 find/replace 단위로 삼되, 원본 대비 길이가 너무 크게
-  //   달라지면(30% 미만 또는 300% 초과) AI가 과하게 축약/왜곡했을 위험으로 보고 그 블록은 버린다.
-  function diffBlocksToConflicts(originalText, revisedText) {
-    const origBlocks = splitEnvelopeBlocks(originalText);
-    const newBlocks = splitEnvelopeBlocks(revisedText);
+    const rebuilt = parts.map((part) => {
+      if (/^\r?\n\r?\n$/.test(part) || !part) return part;
 
-    if (!origBlocks.length || !newBlocks.length) {
-      return { safe: false, reason: "빈 응답", conflicts: [] };
-    }
-    if (origBlocks.length !== newBlocks.length) {
-      return { safe: false, reason: `블록 개수 불일치 (원본 ${origBlocks.length} / 응답 ${newBlocks.length})`, conflicts: [] };
-    }
+      const lines = part.split(/\r?\n/);
+      const dataLineIdx = [];
+      const dataLines = [];
+      lines.forEach((line, i) => {
+        if (/^data:/i.test(line)) { dataLineIdx.push(i); dataLines.push(line.replace(/^data:\s?/i, "")); }
+        else if (line.trim().charAt(0) === "{" || line.trim().charAt(0) === "[") { dataLineIdx.push(i); dataLines.push(line.trim()); }
+      });
+      if (!dataLines.length) return part;
 
-    const conflicts = [];
-    const notes = [];
+      const joined = dataLines.join("\n").trim();
+      if (!joined || joined === "[DONE]") return part;
 
-    for (let i = 0; i < origBlocks.length; i++) {
-      const ob = origBlocks[i];
-      const nb = newBlocks[i];
-      if (ob === nb) continue;
+      const parsed = safeJsonParse(joined, null);
+      if (parsed == null || typeof parsed !== "object") return part;
 
-      const isInfoBlock = /^\[[^\]]+\]/.test(ob);
-
-      if (isInfoBlock) {
-        const oLines = ob.split("\n");
-        const nLines = nb.split("\n");
-        if (oLines.length !== nLines.length) {
-          notes.push(`블록 ${i}: 상태창 줄 수 불일치라 통째로 건너뜀`);
-          continue;
-        }
-        for (let j = 1; j < oLines.length; j++) { // 0번 줄은 "[라벨]" 헤더라 건드리지 않음
-          const oLine = oLines[j];
-          const nLine = nLines[j];
-          if (oLine === nLine) continue;
-          const oLV = splitLabelValue(oLine);
-          const nLV = splitLabelValue(nLine);
-          if (!oLV || !nLV || oLV.label !== nLV.label) {
-            notes.push(`블록 ${i} 줄 ${j}: 라벨 불일치라 건너뜀`);
-            continue;
-          }
-          if (!oLV.value || oLV.value === nLV.value) continue;
-          conflicts.push({ find: oLV.value, replace: nLV.value, reason: `[전체교체] ${oLV.label} 값 변경` });
-        }
-      } else {
-        const ratio = ob.length ? (nb.length / ob.length) : 0;
-        if (ratio < 0.3 || ratio > 3) {
-          notes.push(`블록 ${i}: 길이 변화가 너무 커서(${Math.round(ratio * 100)}%) 안전상 건너뜀`);
-          continue;
-        }
-        conflicts.push({ find: ob, replace: nb, reason: "[전체교체] 대사/지문 블록 변경" });
+      const evType = String(parsed.event || "").toUpperCase();
+      let touched = false;
+      if (evType === "CHAT_COMPLETE" && parsed.replyMessage && envelope.messageId && String(parsed.replyMessage.id) === envelope.messageId) {
+        parsed.replyMessage.contents = newContents;
+        touched = true;
       }
-    }
+      if (evType === "CANDIDATE_COMPLETE" && parsed.candidate && envelope.candidateId && String(parsed.candidate.id) === envelope.candidateId) {
+        parsed.candidate.contents = newContents;
+        touched = true;
+      }
+      if (!touched) return part;
 
-    return { safe: true, conflicts, notes };
+      changed = true;
+      const newJoined = JSON.stringify(parsed);
+      const newLines = [];
+      let inserted = false;
+      lines.forEach((line, i) => {
+        if (dataLineIdx.includes(i)) {
+          if (!inserted) { newLines.push("data: " + newJoined); inserted = true; }
+        } else {
+          newLines.push(line);
+        }
+      });
+      if (!inserted) newLines.push("data: " + newJoined);
+      return newLines.join("\n");
+    });
+
+    return { text: rebuilt.join(""), changed };
+  }
+
+  // 전체 재작성 모드의 메인 파이프라인. 성공하면 { skip:false, newContents }를 돌려준다.
+  async function computeFullRewrite(roomId, userText, envelope) {
+    const debug = getDebug(roomId);
+    const note = normalizeSpace(getNote(roomId));
+    if (!note) { if (debug) toast("📝 유저노트가 비어있어 건너뜀", false); return { skip: true }; }
+
+    const preset = getActivePreset(roomId);
+    if (!preset) { toast("❌ 사용할 API 프리셋이 없습니다.", true); return { skip: true }; }
+
+    if (!capturedAuth) { if (debug) toast("⚠ 아직 인증 토큰을 못 잡아서 로어북/캐릭상세를 못 가져옴", true); return { skip: true }; }
+
+    const roomCtx = await getRoomContext(roomId);
+    if (!roomCtx) { if (debug) toast("⚠ plotId/캐릭터 상세를 못 가져옴", true); return { skip: true }; }
+
+    const personaText = await fetchPersonaText(roomId, roomCtx.plotId);
+
+    const originalFormatted = contentsToRewriteFormat(envelope.contents);
+    if (!originalFormatted) { if (debug) toast("⚠ 원본 답변을 재작성용 포맷으로 변환 못 함", true); return { skip: true }; }
+
+    if (debug) toast(`⏳ 전체 재작성 모드: 컨텍스트(로어북 ${roomCtx.lorebookText.length}자 + 캐릭상세 ${roomCtx.charDetailText.length}자) 포함해서 AI 호출 중...`, false);
+
+    try {
+      const { system, user } = buildFullRewritePrompt(
+        { lorebookText: roomCtx.lorebookText, charDetailText: roomCtx.charDetailText, personaText, note, speakerNames: envelope.speakers },
+        userText,
+        originalFormatted
+      );
+      const aiRes = await callAI(preset, system, user);
+      const rewritten = aiRes && aiRes.text;
+      const usage = aiRes && aiRes.usage;
+
+      if (usage) {
+        const stats = recordTokenUsage(roomId, usage);
+        if (debug) {
+          toast(`🔢 이번 호출 토큰: 입력 ${usage.input} + 출력 ${usage.output} = ${usage.total} (이 방 누적 ${stats.room ? stats.room.total : "?"})`, false);
+        }
+        refreshTokenUI();
+      }
+
+      if (!rewritten || !rewritten.trim()) {
+        if (debug) toast("⚠ AI가 빈 응답을 줌", true);
+        return { skip: true };
+      }
+
+      const newContents = rewriteFormatToContents(rewritten, envelope.contents);
+      if (!newContents || !newContents.length) {
+        if (debug) toast("⚠ AI 응답을 구조화된 답변으로 못 되돌림. 원문 앞부분: " + rewritten.slice(0, 150), true);
+        return { skip: true };
+      }
+
+      if (debug) {
+        console.log("📝 UserNoteCorrector 전체 재작성 결과:", { original: originalFormatted, rewritten, newContents });
+        toast("🔧 전체 재작성됨\n\n[원본]\n" + originalFormatted.slice(0, 300) + "\n\n[재작성]\n" + rewritten.slice(0, 300), false);
+      }
+
+      return { skip: false, newContents };
+    } catch (err) {
+      toast("❌ 전체 재작성 실패: " + (err && err.message || err), true);
+      return { skip: true };
+    }
   }
 
   // 원본에 find가 "정확히 1번만" 존재하는지 검증 후, 통과한 것만 순서대로 적용한다.
@@ -1112,70 +1385,29 @@
     localStorage.setItem("zeta-unc-debug-" + roomId, on ? "1" : "0");
   }
 
+  function getFullRewriteMode(roomId) {
+    return localStorage.getItem("zeta-unc-fullrewrite-" + roomId) === "1";
+  }
+  function setFullRewriteMode(roomId, on) {
+    localStorage.setItem("zeta-unc-fullrewrite-" + roomId, on ? "1" : "0");
+  }
+
   async function computeCorrection(roomId, userText, envelopeText, speakerNames) {
     const debug = getDebug(roomId);
 
-    const rawNote = normalizeSpace(getNote(roomId)) ? getNote(roomId) : "";
-    if (!normalizeSpace(rawNote)) { if (debug) toast("📝 유저노트가 비어있어 건너뜀", false); return { skip: true }; }
-
-    const rosterNames = parseRoster(getRoster(roomId));
-    const filterResult = filterNoteForSpeakers(rawNote, speakerNames, rosterNames);
-    const note = filterResult.text;
-
-    if (!normalizeSpace(note)) {
-      if (debug) toast("✅ 등장인물 필터링 결과 이 화자(" + (speakerNames && speakerNames.join(",") || "?") + ")와 관련된 노트 항목 없음 — 건너뜀", false);
-      return { skip: true };
-    }
-
-    if (debug && filterResult.filtered) {
-      toast("🧹 노트 필터링: 전체 " + filterResult.totalCount + "개 항목 중 " + filterResult.keptCount + "개만 대조에 사용 (화자: " + (speakerNames && speakerNames.join(",") || "?") + ")", false);
-    }
+    const note = normalizeSpace(getNote(roomId));
+    if (!note) { if (debug) toast("📝 유저노트가 비어있어 건너뜀", false); return { skip: true }; }
 
     const preset = getActivePreset(roomId);
     if (!preset) { toast("❌ 사용할 API 프리셋이 없습니다.", true); return { skip: true }; }
 
-    const mode = getMode(roomId);
-    if (debug) toast("⏳ 답변 캡처됨 (" + envelopeText.length + "자, 모드: " + (mode === "full" ? "전체교체" : "find/replace") + ") → AI에 대조 요청 중... (표시가 잠시 지연됩니다)", false);
+    if (debug) toast("⏳ 답변 캡처됨 (" + envelopeText.length + "자) → AI에 대조 요청 중... (표시가 잠시 지연됩니다)", false);
 
     try {
-      let usage;
-      let conflictsFromAi;
-
-      if (mode === "full") {
-        const { system, user } = buildFullReplacePrompt(note, userText, envelopeText, speakerNames);
-        const aiRes = await callAI(preset, system, user);
-        usage = aiRes && aiRes.usage;
-        const revisedText = String((aiRes && aiRes.text) || "").trim();
-
-        if (!revisedText) {
-          if (debug) toast("⚠ 전체교체 모드: AI 응답이 비어있음", true);
-          if (usage) { recordTokenUsage(roomId, usage); refreshTokenUI(); }
-          return { skip: true };
-        }
-
-        const diff = diffBlocksToConflicts(envelopeText, revisedText);
-        if (!diff.safe) {
-          if (debug) toast("⚠ 전체교체 모드: " + diff.reason + " — 안전상 전체 폐기", true);
-          if (usage) { recordTokenUsage(roomId, usage); refreshTokenUI(); }
-          return { skip: true };
-        }
-        if (debug && diff.notes && diff.notes.length) {
-          toast("ℹ 전체교체 diff 참고사항:\n" + diff.notes.join("\n"), false);
-        }
-        conflictsFromAi = diff.conflicts;
-      } else {
-        const { system, user } = buildCorrectionPrompt(note, userText, envelopeText, speakerNames);
-        const aiRes = await callAI(preset, system, user);
-        usage = aiRes && aiRes.usage;
-        const raw = aiRes && aiRes.text;
-        const parsed = parseModelJson(raw);
-        if (!parsed || !Array.isArray(parsed.conflicts)) {
-          if (debug) toast("⚠ AI 응답을 JSON으로 못 읽음. 원문 앞부분: " + String(raw || "").slice(0, 150), true);
-          if (usage) { recordTokenUsage(roomId, usage); refreshTokenUI(); }
-          return { skip: true };
-        }
-        conflictsFromAi = parsed.conflicts;
-      }
+      const { system, user } = buildCorrectionPrompt(note, userText, envelopeText, speakerNames);
+      const aiRes = await callAI(preset, system, user);
+      const raw = aiRes && aiRes.text;
+      const usage = aiRes && aiRes.usage;
 
       if (usage) {
         const stats = recordTokenUsage(roomId, usage);
@@ -1192,9 +1424,14 @@
         toast("ℹ 이 API는 응답에 토큰 사용량을 안 줘서 집계 불가", false);
       }
 
-      if (!conflictsFromAi.length) { if (debug) toast("✅ 대조 완료 — 노트와 모순되는 부분 없음", false); return { skip: true }; }
+      const parsed = parseModelJson(raw);
+      if (!parsed || !Array.isArray(parsed.conflicts)) {
+        if (debug) toast("⚠ AI 응답을 JSON으로 못 읽음. 원문 앞부분: " + String(raw || "").slice(0, 150), true);
+        return { skip: true };
+      }
+      if (!parsed.conflicts.length) { if (debug) toast("✅ 대조 완료 — 노트와 모순되는 부분 없음", false); return { skip: true }; }
 
-      const { result, applied, skipped } = applyConflicts(envelopeText, conflictsFromAi);
+      const { result, applied, skipped } = applyConflicts(envelopeText, parsed.conflicts);
       if (!applied.length) {
         const reasons = skipped.map((s) => (s.find || "").slice(0, 20) + "→" + s.why).join(" / ");
         if (debug) toast("⚠ AI가 " + skipped.length + "건 제안했지만 전부 안전상 폐기됨: " + reasons, true);
@@ -1266,6 +1503,12 @@
     const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
     const isStream = isStreamEndpoint(url, method);
 
+    try {
+      const headers = (init && init.headers) || (typeof input !== "string" && input && input.headers);
+      const authVal = extractAuthFromHeaders(headers);
+      if (authVal) capturedAuth = authVal;
+    } catch { /* ignore */ }
+
     if (!isStream) {
       // 스트림 엔드포인트가 아닌 다른 zeta API 응답(예: 대화 이력 재조회)도,
       // 예전에 적용했던 교정이 있다면 AI 호출 없이 그대로 재적용한다.
@@ -1322,8 +1565,20 @@
         for (let i = 0; i < 100; i++) processedKeys.delete(it.next().value);
       }
 
-      const outcome = await computeCorrection(roomId, userText, envelope.text, envelope.speakers);
+      const outcome = getFullRewriteMode(roomId)
+        ? await computeFullRewrite(roomId, userText, envelope)
+        : await computeCorrection(roomId, userText, envelope.text, envelope.speakers);
       if (outcome.skip) return passthroughResponse(response, rawText);
+
+      if (outcome.newContents) {
+        const structResult = patchStructuredContents(rawText, envelope, outcome.newContents);
+        if (structResult.changed) {
+          if (debug) toast("✅ 전체 재작성 반영됨 (네트워크 응답에 반영)", false);
+          return passthroughResponse(response, structResult.text);
+        }
+        if (debug) toast("⚠ 재작성은 계산됐지만 응답 본문 안에서 해당 메시지를 못 찾아 패치 실패", true);
+        return passthroughResponse(response, rawText);
+      }
 
       const patchResult = applyCorrectionsToRawText(rawText, outcome.applied);
       if (patchResult.changed) {
@@ -1408,6 +1663,7 @@
 
   OrigXHR.prototype.setRequestHeader = function (name, value) {
     if (this.__uncHeaders) this.__uncHeaders[name] = value;
+    if (name && name.toLowerCase() === "authorization") capturedAuth = value;
     return origSetRequestHeader.call(this, name, value);
   };
 
@@ -1513,15 +1769,27 @@
               const it = processedKeys.values();
               for (let i = 0; i < 100; i++) processedKeys.delete(it.next().value);
             }
-            const outcome = await computeCorrection(roomId, userText, envelope.text, envelope.speakers);
+            const outcome = getFullRewriteMode(roomId)
+              ? await computeFullRewrite(roomId, userText, envelope)
+              : await computeCorrection(roomId, userText, envelope.text, envelope.speakers);
             if (!outcome.skip) {
-              const patched = applyCorrectionsToRawText(rawText, outcome.applied);
-              if (patched.changed) {
-                finalText = patched.text;
-                recordCorrections(roomId, outcome.applied);
-                if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
-              } else if (debug) {
-                toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
+              if (outcome.newContents) {
+                const structResult = patchStructuredContents(rawText, envelope, outcome.newContents);
+                if (structResult.changed) {
+                  finalText = structResult.text;
+                  if (debug) toast("✅ 전체 재작성 반영됨 (XHR 응답에 반영)", false);
+                } else if (debug) {
+                  toast("⚠ 재작성은 계산됐지만 응답 본문 안에서 해당 메시지를 못 찾아 패치 실패", true);
+                }
+              } else {
+                const patched = applyCorrectionsToRawText(rawText, outcome.applied);
+                if (patched.changed) {
+                  finalText = patched.text;
+                  recordCorrections(roomId, outcome.applied);
+                  if (debug) toast("✅ 유저노트 기준 " + outcome.applied.length + "곳 수정함 (XHR 응답에 반영)", false);
+                } else if (debug) {
+                  toast("⚠ 수정은 계산됐지만 응답 본문 안에서 원문을 못 찾아 패치 실패", true);
+                }
               }
             }
           }
@@ -1603,9 +1871,7 @@
     padding: 8px; font-size: 12px; margin-top: 4px;
   }
   textarea { height: 30vh; resize: vertical; }
-  textarea.roster { height: auto; min-height: 44px; resize: vertical; }
   label { display: block; font-size: 11px; color: #ccc; margin-top: 8px; }
-  .hint { font-size: 10px; color: #888; margin-top: 3px; line-height: 1.4; }
   .row { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
   .row.check { align-items: center; gap: 6px; }
   button { background: #333; color: #fff; border: none; border-radius: 8px; padding: 7px 6px; font-size: 11px; cursor: pointer; flex: 1; }
@@ -1641,21 +1907,11 @@
       <input type="checkbox" id="debugMode" style="width:auto;margin:0;">
       <label style="margin:0;">디버그 로그 보기 (평소엔 꺼두세요)</label>
     </div>
-
-    <label>교정 방식
-      <select id="modeSelect">
-        <option value="conflict">find/replace (기존 방식, 국소 수정)</option>
-        <option value="full">전체 교체 (답변 통째로 다시 쓰게 한 뒤 자동 diff)</option>
-      </select>
-    </label>
-    <div class="hint">전체 교체는 AI가 답변 전체를 다시 쓰지만, 실제 반영 전에 원본과 자동으로 비교해서 바뀐 부분만 안전하게 적용합니다. 블록 개수가 안 맞으면 통째로 폐기됩니다. 토큰 사용량은 find/replace보다 더 많이 듭니다.</div>
-
-    <label>등장인물 목록 (쉼표로 구분, 예: 김젯시,이젯시,박젯시)
-      <textarea id="roster" class="roster" placeholder="예: 김젯시,이젯시,박젯시"></textarea>
-    </label>
-    <div class="hint">여기 적은 이름을 기준으로, 노트 항목마다 "지금 화자와 관련 있는 항목인지"를 자동으로 걸러서 AI에게 넘깁니다. 비워두면 필터링 없이 노트 전체를 매번 넘깁니다.</div>
-
-    <textarea id="note" placeholder="유저노트 글자수가 늘어나면 API 설정란의 토큰 사용량도 같이 늘어납니다.&#10;글자수/비용은 API 설정 탭에서 확인하며 조절하세요.&#10;&#10;노트는 빈 줄로 항목을 구분해서 적어주세요 (등장인물 필터링이 항목 단위로 작동합니다).&#10;&#10;출력 방식/규칙(예: 짧게 출력, 내레이션 금지 등)은 이 기능으로는 반영되지 않습니다."></textarea>
+    <div class="row check">
+      <input type="checkbox" id="fullRewriteMode" style="width:auto;margin:0;">
+      <label style="margin:0;">전체 재작성 모드 (실험적, 로어북/캐릭상세 포함)</label>
+    </div>
+    <textarea id="note" placeholder="유저노트 글자수가 늘어나면 API 설정란의 토큰 사용량도 같이 늘어납니다.&#10;글자수/비용은 API 설정 탭에서 확인하며 조절하세요.&#10;&#10;출력 방식/규칙(예: 짧게 출력, 내레이션 금지 등)은 이 기능으로는 반영되지 않습니다."></textarea>
     <div class="count" id="count">0자</div>
     <div class="row">
       <button class="primary" id="saveNote">저장</button>
@@ -1708,13 +1964,12 @@
   const btnEl = el("btn");
   const panelEl = el("panel");
   const noteEl = el("note");
-  const modeSelectEl = el("modeSelect");
-  const rosterEl = el("roster");
   const roomEl = el("room");
   const countEl = el("count");
   const savedEl = el("saved");
   const enabledEl = el("enabled");
   const debugModeEl = el("debugMode");
+  const fullRewriteModeEl = el("fullRewriteMode");
   const presetSelectEl = el("presetSelect");
   const presetNameEl = el("presetName");
   const providerEl = el("provider");
@@ -1782,10 +2037,9 @@
   function refreshRoomUI() {
     roomEl.textContent = "Room: " + (roomId ? roomId.slice(0, 24) : "(감지 안 됨)");
     noteEl.value = getNote(roomId);
-    modeSelectEl.value = getMode(roomId);
-    rosterEl.value = getRoster(roomId);
     enabledEl.checked = getEnabled(roomId);
     debugModeEl.checked = getDebug(roomId);
+    fullRewriteModeEl.checked = getFullRewriteMode(roomId);
     updateCount();
     refreshPresetUI();
     refreshTokenUI();
@@ -1801,12 +2055,11 @@
   noteEl.addEventListener("input", () => { updateCount(); });
   el("saveNote").addEventListener("click", () => {
     saveNote(roomId, noteEl.value);
-    saveRoster(roomId, rosterEl.value);
     flashSaved("저장됨");
   });
   enabledEl.addEventListener("change", () => setEnabled(roomId, enabledEl.checked));
   debugModeEl.addEventListener("change", () => setDebug(roomId, debugModeEl.checked));
-  modeSelectEl.addEventListener("change", () => setMode(roomId, modeSelectEl.value));
+  fullRewriteModeEl.addEventListener("change", () => setFullRewriteMode(roomId, fullRewriteModeEl.checked));
 
   // ---- API 탭 ----
   function refreshPresetUI() {
